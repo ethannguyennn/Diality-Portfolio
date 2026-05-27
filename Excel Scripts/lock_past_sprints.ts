@@ -1,7 +1,7 @@
 function main(workbook: ExcelScript.Workbook) {
 
   const ws: ExcelScript.Worksheet = workbook.getWorksheets()[0];
-  const PASSWORD = "dswd"; // Store once, use everywhere
+  const PASSWORD = "PASSWORD"; // Store once, use everywhere
 
   // Change value on excel every sprint manually
   const CURRENT_SPRINT: number = ws.getRange("B2").getValue() as number; 
