@@ -10,10 +10,14 @@ from datetime import datetime
 load_dotenv()
 
 BASE_URL = "https://diality.atlassian.net"
-PROJECT  = "LDT"
+PROJECT = "LDT"
+
+SWVV_TEAM = ["Raghu Kallala", "Thomas Lippold", "Tejaskumar Patel", "Tiffany Mejia", "Zoltan Miskolci", "Sarina Cheung", "Tisha Patel", "Ethan Nguyen"]
+FW_TEAM = ["Arpita Srivastava", "Jashwant Gantyada", "Michael Garthwaite", "Praneeth Bunne", "Sameer Poyil", "Varshini Nagabooshanam", "Vijay Pamula", "Suresh Dharnala"]
+SW_TEAM = ["Nicholas Ramirez", "Stephen Quong", "Dara Navaei", "Eliza Petersen", "Christina Heine", "Caitlynn Chang"]
+TEAMS = [SWVV_TEAM, FW_TEAM, SW_TEAM]
 
 
-# ─── Jira Fetch ────────────────────────────────────────────
 def _fetch_paginated(url, jql, auth):
     all_issues = []
     start_at = 0
@@ -51,8 +55,11 @@ def _get_active_sprint(auth):
     return values[0] if values else None
 
 
+def _sprint_names(s):
+    return {n.strip() for n in s.split(",") if n.strip()} if s else set()
+
+
 def _was_removed_from_sprint(issue, sprint_name):
-    """Return True if this issue was explicitly added to then removed from the given sprint."""
     was_added = was_removed = False
     for history in issue["changelog"]["histories"]:
         for item in history["items"]:
@@ -70,7 +77,6 @@ def _was_removed_from_sprint(issue, sprint_name):
 def get_jira_issues():
     auth = HTTPBasicAuth(os.getenv("JIRA_EMAIL"), os.getenv("JIRA_API_TOKEN"))
 
-    # Board API for tickets currently in open/closed sprints
     board_issues = _fetch_paginated(
         f"{BASE_URL}/rest/agile/1.0/board/84/issue",
         "sprint in openSprints() OR sprint in closedSprints()",
@@ -78,8 +84,9 @@ def get_jira_issues():
     )
 
     # The search API 'was' operator is unavailable on this Jira instance.
-    # Instead: fetch recently-updated backlog items and identify removed-from-sprint
-    # tickets via changelog analysis.
+    # Fetch recently-updated backlog items and identify removed-from-sprint
+    # tickets via changelog analysis instead.
+    seen = {i["key"] for i in board_issues}
     removed_issues = []
     active_sprint = _get_active_sprint(auth)
     if active_sprint:
@@ -92,17 +99,14 @@ def get_jira_issues():
                 f"project = {PROJECT} AND updated >= '{start_str}'",
                 auth,
             )
-            seen = {i["key"] for i in board_issues}
             removed_issues = [
                 i for i in backlog_issues
                 if i["key"] not in seen and _was_removed_from_sprint(i, sprint_name)
             ]
 
-    seen = {i["key"] for i in board_issues}
-    return board_issues + [i for i in removed_issues if i["key"] not in seen]
+    return board_issues + removed_issues
 
 
-# ─── Sprint Helpers ─────────────────────────────────────────
 def _sprint_num(name):
     m = re.search(r'(\d+)', name)
     return int(m.group(1)) if m else -1
@@ -112,12 +116,10 @@ def get_latest_sprint(sprint_info):
     return max(sprint_info, key=lambda s: _sprint_num(s.get("name", "")))
 
 
-# ─── Type Logic ────────────────────────────────────────────
 def get_type(issue):
     issuetype = issue["fields"]["issuetype"]["name"].lower()
     summary = issue["fields"].get("summary", "").lower()
 
-    # dialin check first — takes priority over bug
     if "dialin" in issuetype or "dialin" in summary:
         return "Dialin Ticket"
     elif issuetype == "bug":
@@ -128,7 +130,6 @@ def get_type(issue):
         return "Big-V"
 
 
-# ─── Scope Logic ───────────────────────────────────────────
 def parse_date(date_str):
     if not date_str:
         return None
@@ -137,13 +138,7 @@ def parse_date(date_str):
     return datetime.fromisoformat(date_str)
 
 
-def _sprint_names(s):
-    """Split a Jira sprint changelog string into a set of sprint names."""
-    return {n.strip() for n in s.split(",") if n.strip()} if s else set()
-
-
 def _classify_sprint_timing(sprint, histories):
-    """Returns 'Added to Scope' or 'Scoped' based on when the ticket entered this sprint."""
     sprint_name = sprint["name"]
     sprint_start_dt = parse_date(sprint.get("startDate"))
 
@@ -173,18 +168,14 @@ def get_scope(issue):
     sprint_info = issue["fields"].get("customfield_10020")
     histories = issue["changelog"]["histories"]
 
-    # No sprint association at all — was removed from the open sprint entirely
     if not sprint_info:
         return "Removed from Scope"
 
     latest_sprint = get_latest_sprint(sprint_info)
 
-    # Ticket is currently in the active sprint
     if latest_sprint.get("state") == "active":
         return _classify_sprint_timing(latest_sprint, histories)
 
-    # Latest sprint is closed — check if a higher-numbered sprint was removed from this ticket,
-    # which means it was pulled out of the current open sprint
     latest_num = _sprint_num(latest_sprint["name"])
     for history in histories:
         for item in history["items"]:
@@ -196,11 +187,9 @@ def get_scope(issue):
                 if _sprint_num(removed) > latest_num:
                     return "Removed from Scope"
 
-    # Ticket is in a closed sprint with no higher-sprint removal — normal closed sprint ticket
     return _classify_sprint_timing(latest_sprint, histories)
 
 
-# ─── Status Logic ──────────────────────────────────────────
 def get_status(issue):
     status = issue["fields"]["status"]
     status_name = status["name"].lower()
@@ -216,7 +205,15 @@ def get_status(issue):
         return "Not Started"
 
 
-# ─── Build Excel ───────────────────────────────────────────
+def _issue_sort_key(issue):
+    fields = issue["fields"]
+    sprint_info = fields.get("customfield_10020")
+    sprint_num = _sprint_num(get_latest_sprint(sprint_info)["name"]) if sprint_info else 9999
+    assignee = fields["assignee"]["displayName"] if fields.get("assignee") else ""
+    team_idx = next((i for i, team in enumerate(TEAMS) if assignee in team), len(TEAMS))
+    return (sprint_num, team_idx, assignee)
+
+
 def create_excel(issues):
     wb = Workbook()
     ws = wb.active
@@ -245,15 +242,15 @@ def create_excel(issues):
         fields = issue["fields"]
         key = issue["key"]
 
-        sprint_info    = fields.get("customfield_10020")
-        sprint         = str(_sprint_num(get_latest_sprint(sprint_info)["name"])) if sprint_info else ""
-        assignee       = fields["assignee"]["displayName"] if fields.get("assignee") else "Unassigned"
-        issue_type     = get_type(issue)
-        scope          = get_scope(issue)
-        ticket_url     = f"{BASE_URL}/browse/{key}"
-        ticket_label   = f"[{key}] {fields.get('summary', '')}"
+        sprint_info = fields.get("customfield_10020")
+        sprint = str(_sprint_num(get_latest_sprint(sprint_info)["name"])) if sprint_info else ""
+        assignee = fields["assignee"]["displayName"] if fields.get("assignee") else "Unassigned"
+        issue_type = get_type(issue)
+        scope = get_scope(issue)
+        ticket_url = f"{BASE_URL}/browse/{key}"
+        ticket_label = f"[{key}] {fields.get('summary', '')}"
         has_description = "Yes" if fields.get("description") else "No"
-        status         = get_status(issue)
+        status = get_status(issue)
 
         row_data = [sprint, assignee, issue_type, scope, ticket_label, has_description, status]
 
@@ -279,18 +276,16 @@ def create_excel(issues):
     ws.freeze_panes = "A2"
 
     output = "sprint_management.xlsx"
-    if os.path.exists(output):
-        os.remove(output)
-        print(f"Deleted existing {output}")
     wb.save(output)
     print(f"Saved: {output} ({row_idx - 1} tickets)")
 
 
-# ─── Main ──────────────────────────────────────────────────
 def main():
     print("Fetching issues from Jira...")
     issues = get_jira_issues()
     print(f"Found {len(issues)} issues")
+
+    issues.sort(key=_issue_sort_key)
 
     print("Building Excel...")
     create_excel(issues)
