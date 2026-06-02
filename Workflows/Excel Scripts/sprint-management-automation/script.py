@@ -1,13 +1,15 @@
+import argparse
 import os
 import re
 import smtplib
 import traceback
 import requests
+from copy import copy
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from datetime import datetime
 
@@ -22,6 +24,13 @@ SW_TEAM = ["Nicholas Ramirez", "Stephen Quong", "Dara Navaei", "Eliza Petersen",
 TEAMS = [SWVV_TEAM, FW_TEAM, SW_TEAM]
 
 NOTIFICATION_EMAILS = [os.getenv("JIRA_EMAIL")]
+
+STATUS_COLORS = {
+    "In Progress": "FFF2CC",
+    "Done":        "D9EAD3",
+    "Not Started": "F4CCCC",
+    "Blocked":     "EA9999",
+}
 
 
 def _fetch_paginated(url, jql, auth):
@@ -48,6 +57,26 @@ def _fetch_paginated(url, jql, auth):
             break
 
     return all_issues
+
+
+def _get_all_board_sprints(auth):
+    """Return every sprint on board 84 across all states, handling pagination."""
+    sprints = []
+    start_at = 0
+    while True:
+        r = requests.get(
+            f"{BASE_URL}/rest/agile/1.0/board/84/sprint",
+            params={"state": "active,closed,future", "maxResults": 50, "startAt": start_at},
+            auth=auth,
+        )
+        r.raise_for_status()
+        data = r.json()
+        page = data.get("values", [])
+        sprints.extend(page)
+        start_at += len(page)
+        if data.get("isLast", True) or not page:
+            break
+    return sprints
 
 
 def _get_active_sprint(auth):
@@ -85,7 +114,7 @@ def get_jira_issues():
 
     board_issues = _fetch_paginated(
         f"{BASE_URL}/rest/agile/1.0/board/84/issue",
-        "sprint in openSprints() OR sprint in closedSprints()",
+        "sprint in openSprints() OR sprint in closedSprints() OR sprint in futureSprints()",
         auth,
     )
 
@@ -244,11 +273,13 @@ def _issue_sort_key(issue):
     return (sprint_num, team_idx, assignee)
 
 
-def create_excel(issues):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Sprint Management"
+def _extract_key(label):
+    """Extract Jira key from a cell label like '[LDT-123] Summary title'."""
+    m = re.match(r'\[([A-Z]+-\d+)\]', label or '')
+    return m.group(1) if m else None
 
+
+def _ensure_sheet_setup(ws):
     headers = ["Sprint", "Assignee", "Type", "Scope Changes", "Jira #", "Description", "Status"]
     header_fill = PatternFill(fill_type="solid", fgColor="1F3864")
     header_font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
@@ -260,68 +291,238 @@ def create_excel(issues):
         cell.alignment = Alignment(horizontal="left", vertical="center")
 
     ws.row_dimensions[1].height = 20
-
-    status_colors = {
-        "In Progress": "FFF2CC",
-        "Done":        "D9EAD3",
-        "Not Started": "F4CCCC",
-        "Blocked":     "EA9999",
-    }
-
-    for row_idx, issue in enumerate(issues, start=2):
-        fields = issue["fields"]
-        key = issue["key"]
-
-        sprint_info = fields.get("customfield_10020")
-        sprint = str(_sprint_num(get_latest_sprint(sprint_info)["name"])) if sprint_info else ""
-        assignee = fields["assignee"]["displayName"] if fields.get("assignee") else "Unassigned"
-        issue_type = get_type(issue)
-        scope = get_scope(issue)
-        ticket_url = f"{BASE_URL}/browse/{key}"
-        ticket_label = f"[{key}] {fields.get('summary', '')}"
-        has_description = "Yes" if fields.get("description") else "No"
-        status = get_status(issue)
-
-        row_data = [sprint, assignee, issue_type, scope, ticket_label, has_description, status]
-
-        for col, value in enumerate(row_data, start=1):
-            cell = ws.cell(row=row_idx, column=col, value=value)
-            cell.font = Font(name="Arial", size=10)
-            cell.alignment = Alignment(horizontal="left", vertical="center")
-
-            if col == 5:
-                cell.hyperlink = ticket_url
-                cell.font = Font(name="Arial", size=10, color="1155CC", underline="single")
-
-            if col == 6:
-                cell.fill = PatternFill(fill_type="solid", fgColor="D9EAD3" if has_description == "Yes" else "F4CCCC")
-
-            if col == 7:
-                cell.fill = PatternFill(fill_type="solid", fgColor=status_colors.get(status, "FFFFFF"))
+    ws.freeze_panes = "A2"
 
     widths = {"A": 8, "B": 22, "C": 15, "D": 18, "E": 75, "F": 14, "G": 15}
     for col_letter, width in widths.items():
         ws.column_dimensions[col_letter].width = width
 
-    ws.freeze_panes = "A2"
 
-    output = "sprint_management.xlsx"
-    wb.save(output)
-    print(f"Saved: {output} ({row_idx - 1} tickets)")
+def _write_issue_row(ws, row_idx, issue):
+    fields = issue["fields"]
+    key = issue["key"]
+
+    sprint_info = fields.get("customfield_10020")
+    sprint = str(_sprint_num(get_latest_sprint(sprint_info)["name"])) if sprint_info else ""
+    assignee = fields["assignee"]["displayName"] if fields.get("assignee") else "Unassigned"
+    issue_type = get_type(issue)
+    scope = get_scope(issue)
+    ticket_url = f"{BASE_URL}/browse/{key}"
+    ticket_label = f"[{key}] {fields.get('summary', '')}"
+    has_description = "Yes" if fields.get("description") else "No"
+    status = get_status(issue)
+
+    values = [sprint, assignee, issue_type, scope, ticket_label, has_description, status]
+    base_align = Alignment(horizontal="left", vertical="center")
+
+    for col, value in enumerate(values, start=1):
+        cell = ws.cell(row=row_idx, column=col, value=value)
+        cell.alignment = base_align
+        cell.fill = PatternFill()
+        cell.hyperlink = None
+        cell.font = Font(name="Arial", size=10)
+
+        if col == 5:
+            cell.hyperlink = ticket_url
+            cell.font = Font(name="Arial", size=10, color="1155CC", underline="single")
+        elif col == 6:
+            cell.fill = PatternFill(fill_type="solid", fgColor="D9EAD3" if has_description == "Yes" else "F4CCCC")
+        elif col == 7:
+            cell.fill = PatternFill(fill_type="solid", fgColor=STATUS_COLORS.get(status, "FFFFFF"))
+
+
+def _sort_data_rows(ws, api_map):
+    max_row = ws.max_row
+    if max_row < 3:
+        return
+
+    rows_data = []
+    for row_idx in range(2, max_row + 1):
+        cells = []
+        for col_idx in range(1, 8):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cells.append({
+                'value': cell.value,
+                'hyperlink': cell.hyperlink.target if cell.hyperlink else None,
+                'font': copy(cell.font),
+                'fill': copy(cell.fill),
+                'alignment': copy(cell.alignment),
+            })
+
+        key = _extract_key(cells[4]['value'])
+        if key and key in api_map:
+            sort_key = _issue_sort_key(api_map[key])
+        else:
+            try:
+                sprint_num = int(cells[0]['value'] or 9999)
+            except (ValueError, TypeError):
+                sprint_num = 9999
+            assignee = cells[1]['value'] or ''
+            team_idx = next((i for i, t in enumerate(TEAMS) if assignee in t), len(TEAMS))
+            sort_key = (sprint_num, team_idx, assignee)
+
+        rows_data.append((sort_key, cells))
+
+    rows_data.sort(key=lambda x: x[0])
+
+    for row_idx, (_, cells) in enumerate(rows_data, start=2):
+        for col_idx, cd in enumerate(cells, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.value = cd['value']
+            cell.font = cd['font']
+            cell.fill = cd['fill']
+            cell.alignment = cd['alignment']
+            cell.hyperlink = cd['hyperlink']
+
+
+def update_excel(input_path, issues):
+    try:
+        wb = load_workbook(input_path)
+    except FileNotFoundError:
+        wb = Workbook()
+        wb.active.title = "Sprint Management"
+
+    if "Sprint Management" in wb.sheetnames:
+        ws = wb["Sprint Management"]
+    else:
+        ws = wb.create_sheet("Sprint Management")
+
+    _ensure_sheet_setup(ws)
+
+    # Map every existing data row by its Jira key
+    existing = {}
+    for row_idx in range(2, ws.max_row + 1):
+        label = ws.cell(row=row_idx, column=5).value
+        key = _extract_key(label)
+        if key:
+            existing[key] = row_idx
+
+    api_map = {issue["key"]: issue for issue in issues}
+
+    # Update rows present in both the sheet and the API
+    updated = set()
+    for key, row_idx in existing.items():
+        if key in api_map:
+            _write_issue_row(ws, row_idx, api_map[key])
+            updated.add(key)
+
+    # Delete rows that no longer appear in the API (reverse order preserves indices)
+    to_delete = sorted(
+        [existing[k] for k in existing if k not in api_map],
+        reverse=True,
+    )
+    for row_idx in to_delete:
+        ws.delete_rows(row_idx)
+
+    # Append rows for tickets not yet in the sheet
+    new_keys = [k for k in api_map if k not in existing]
+    next_row = ws.max_row + 1
+    for key in new_keys:
+        _write_issue_row(ws, next_row, api_map[key])
+        next_row += 1
+
+    _sort_data_rows(ws, api_map)
+
+    wb.save(input_path)
+    print(
+        f"Saved: {input_path} "
+        f"({len(api_map)} tickets | "
+        f"{len(updated)} updated, {len(new_keys)} added, {len(to_delete)} removed)"
+    )
+
+
+def debug_sprints(auth):
+    print("\n=== DEBUG: Sprint Diagnosis ===\n")
+
+    # Step 1 — what the updated board JQL actually returns
+    print("Step 1: Fetching via board JQL (open + closed + future)...")
+    board_issues = _fetch_paginated(
+        f"{BASE_URL}/rest/agile/1.0/board/84/issue",
+        "sprint in openSprints() OR sprint in closedSprints() OR sprint in futureSprints()",
+        auth,
+    )
+    sprint_counts: dict = {}
+    for issue in board_issues:
+        sprint_info = issue["fields"].get("customfield_10020")
+        if sprint_info:
+            num = _sprint_num(get_latest_sprint(sprint_info).get("name", ""))
+            sprint_counts[num] = sprint_counts.get(num, 0) + 1
+    print(f"  Total issues fetched: {len(board_issues)}")
+    print(f"  Breakdown by sprint: {dict(sorted(sprint_counts.items()))}")
+    for target in [31, 32]:
+        count = sprint_counts.get(target, 0)
+        status = "OK" if count > 0 else "MISSING"
+        print(f"  Sprint {target}: {count} issues [{status}]")
+
+    # Step 2 — list every sprint on board 84 with its state
+    print("\nStep 2: All sprints on board 84...")
+    all_sprints = _get_all_board_sprints(auth)
+    if not all_sprints:
+        print("  WARNING: No sprints returned — check board ID or auth.")
+    for s in sorted(all_sprints, key=lambda x: _sprint_num(x.get("name", ""))):
+        num = _sprint_num(s.get("name", ""))
+        marker = " <-- TARGET" if num in [31, 32] else ""
+        print(f"  Sprint {num:3d} | state={s.get('state', '?'):8s} | id={s['id']:6d} | {s.get('name', '')}{marker}")
+
+    # Step 3 — direct per-sprint fetch for 31 and 32
+    print("\nStep 3: Direct issue fetch for sprints 31 and 32...")
+    board_keys = {i["key"] for i in board_issues}
+    for target in [31, 32]:
+        sprint_obj = next(
+            (s for s in all_sprints if _sprint_num(s.get("name", "")) == target), None
+        )
+        if not sprint_obj:
+            print(f"  Sprint {target}: NOT found on board 84 at all — board sub-filter may exclude it.")
+            continue
+        sid = sprint_obj["id"]
+        state = sprint_obj["state"]
+        name = sprint_obj["name"]
+        direct = _fetch_paginated(
+            f"{BASE_URL}/rest/agile/1.0/sprint/{sid}/issue",
+            f"project = {PROJECT}",
+            auth,
+        )
+        direct_keys = {i["key"] for i in direct}
+        missing = direct_keys - board_keys
+        print(f"  Sprint {target} (id={sid}, state={state}): '{name}'")
+        print(f"    Direct sprint endpoint: {len(direct)} issues")
+        print(f"    Already in board fetch: {len(direct_keys & board_keys)}")
+        if missing:
+            print(f"    MISSING from board fetch: {sorted(missing)}")
+            print(f"    --> These tickets exist but the board JQL/filter is excluding them.")
+        else:
+            print(f"    All issues accounted for in board fetch.")
+
+    print("\n=== END DEBUG ===\n")
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Update sprint management Excel from Jira.")
+    parser.add_argument(
+        "input",
+        nargs="?",
+        default="sprint_management.xlsx",
+        help="Path to the Excel file to update (default: sprint_management.xlsx)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Run sprint diagnostics to identify missing tickets instead of updating Excel",
+    )
+    args = parser.parse_args()
+
+    if args.debug:
+        auth = HTTPBasicAuth(os.getenv("JIRA_EMAIL"), os.getenv("JIRA_API_TOKEN"))
+        debug_sprints(auth)
+        return
+
     try:
         print("Fetching issues from Jira...")
         issues = get_jira_issues()
         print(f"Found {len(issues)} issues")
-
-        issues.sort(key=_issue_sort_key)
-
-        print("Building Excel...")
-        create_excel(issues)
+        print("Updating Excel...")
+        update_excel(args.input, issues)
         print("Done!")
-
         _send_notification(
             "Sprint Management: Success",
             f"Script ran successfully.\n{len(issues)} tickets processed.",
