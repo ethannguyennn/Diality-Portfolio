@@ -1,6 +1,10 @@
 import os
 import re
+import smtplib
+import traceback
 import requests
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 from openpyxl import Workbook
@@ -16,6 +20,8 @@ SWVV_TEAM = ["Raghu Kallala", "Thomas Lippold", "Tejaskumar Patel", "Tiffany Mej
 FW_TEAM = ["Arpita Srivastava", "Jashwant Gantyada", "Michael Garthwaite", "Praneeth Bunne", "Sameer Poyil", "Varshini Nagabooshanam", "Vijay Pamula", "Suresh Dharnala"]
 SW_TEAM = ["Nicholas Ramirez", "Stephen Quong", "Dara Navaei", "Eliza Petersen", "Christina Heine", "Caitlynn Chang"]
 TEAMS = [SWVV_TEAM, FW_TEAM, SW_TEAM]
+
+NOTIFICATION_EMAILS = [os.getenv("JIRA_EMAIL")]
 
 
 def _fetch_paginated(url, jql, auth):
@@ -205,6 +211,30 @@ def get_status(issue):
         return "Not Started"
 
 
+def _send_notification(subject, body):
+    if not NOTIFICATION_EMAILS:
+        return
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = int(os.getenv("SMTP_PORT", 587))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    smtp_from = os.getenv("SMTP_FROM")
+    if not all([smtp_host, smtp_user, smtp_password, smtp_from]):
+        print("Warning: SMTP env vars not fully configured, skipping notification.")
+        return
+    msg = MIMEMultipart()
+    msg["From"] = smtp_from
+    msg["To"] = ", ".join(NOTIFICATION_EMAILS)
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_from, NOTIFICATION_EMAILS, msg.as_string())
+
+
 def _issue_sort_key(issue):
     fields = issue["fields"]
     sprint_info = fields.get("customfield_10020")
@@ -281,15 +311,27 @@ def create_excel(issues):
 
 
 def main():
-    print("Fetching issues from Jira...")
-    issues = get_jira_issues()
-    print(f"Found {len(issues)} issues")
+    try:
+        print("Fetching issues from Jira...")
+        issues = get_jira_issues()
+        print(f"Found {len(issues)} issues")
 
-    issues.sort(key=_issue_sort_key)
+        issues.sort(key=_issue_sort_key)
 
-    print("Building Excel...")
-    create_excel(issues)
-    print("Done!")
+        print("Building Excel...")
+        create_excel(issues)
+        print("Done!")
+
+        _send_notification(
+            "Sprint Management: Success",
+            f"Script ran successfully.\n{len(issues)} tickets processed.",
+        )
+    except Exception:
+        _send_notification(
+            "Sprint Management: Failed",
+            f"Script failed with the following error:\n\n{traceback.format_exc()}",
+        )
+        raise
 
 
 if __name__ == "__main__":
