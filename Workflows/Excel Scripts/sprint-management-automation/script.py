@@ -12,7 +12,7 @@ from email.mime.text import MIMEText
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from datetime import datetime
@@ -93,6 +93,13 @@ SHEET_HEADERS = ["Sprint", "Assignee", " Type", "Scope Changes", "Description", 
 TABLE_DISPLAY_NAME = "Table1"
 TABLE_STYLE        = "TableStyleMedium2"
 
+MIN_SPRINT = 28  # ignore every sprint before this number
+
+# Thin vertical separator for white rows — left edge of every column after the first.
+# Green rows use an empty border so the separator only appears on white rows.
+_WHITE_COL_BORDER = Border(left=Side(style="thin", color="E0E0E0"))
+_EMPTY_BORDER     = Border()
+
 
 
 # ── Jira fetch ────────────────────────────────────────────────────────────────
@@ -125,11 +132,14 @@ def _sprint_names(s):
 
 
 def _has_sprint_history(issue):
-    """Return True if the changelog contains at least one Sprint field transition."""
+    """Return True if the changelog contains a Sprint transition into sprint >= MIN_SPRINT."""
     for history in issue["changelog"]["histories"]:
         for item in history["items"]:
-            if item["field"] == "Sprint":
-                return True
+            if item["field"] != "Sprint":
+                continue
+            for name in _sprint_names(item.get("toString") or ""):
+                if _sprint_num(name) >= MIN_SPRINT:
+                    return True
     return False
 
 
@@ -266,13 +276,13 @@ def get_sprint_history(issue):
     for name in all_sprint_names:
         if name not in current_sprint_names:
             num = _sprint_num(name)
-            if num >= 0:
+            if num >= MIN_SPRINT:
                 sprint_entries[num] = "Move out of Sprint"
 
     # Pass 2: currently-held sprints → timing classification overwrites any conflict
     for name, sprint_obj in current_sprint_objs.items():
         num = _sprint_num(name)
-        if num >= 0:
+        if num >= MIN_SPRINT:
             sprint_entries[num] = _classify_sprint_timing(sprint_obj, histories)
 
     return sorted(sprint_entries.items(), key=lambda x: x[0])  # [(sprint_num, scope), ...]
@@ -447,7 +457,9 @@ def _apply_alternating_fills(ws):
         bg = _row_bg(row_idx)
 
         for col in range(1, 11):  # A through J (col 10); K+ are unused and left blank
-            ws.cell(row=row_idx, column=col).fill = PatternFill(fill_type="solid", fgColor=bg)
+            cell        = ws.cell(row=row_idx, column=col)
+            cell.fill   = PatternFill(fill_type="solid", fgColor=bg)
+            cell.border = _WHITE_COL_BORDER if (bg == "FFFFFF" and col > 1) else _EMPTY_BORDER
 
 
 def _sort_data_rows(ws, api_map):
@@ -533,11 +545,12 @@ def _ensure_table_in_model(ws, new_ref: str) -> None:
         ws.add_table(tbl)
 
 
-def _generate_table_xml(ref: str, tbl_id: int, name: str, display_name: str, style: str) -> bytes:
-    """Build a complete, valid OOXML table definition for the given ref."""
+def _generate_table_xml(ref: str, tbl_id: int, name: str, display_name: str, style: str,
+                        col_names: list) -> bytes:
+    """Build a complete, valid OOXML table definition for the given ref and column list."""
     cols_xml = "".join(
         f'<tableColumn id="{i + 1}" name="{col}"/>'
-        for i, col in enumerate(SHEET_HEADERS)
+        for i, col in enumerate(col_names)
     )
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -545,20 +558,21 @@ def _generate_table_xml(ref: str, tbl_id: int, name: str, display_name: str, sty
         f' id="{tbl_id}" name="{name}" displayName="{display_name}"'
         f' ref="{ref}" totalsRowShown="0">'
         f'<autoFilter ref="{ref}"/>'
-        f'<tableColumns count="{len(SHEET_HEADERS)}">{cols_xml}</tableColumns>'
+        f'<tableColumns count="{len(col_names)}">{cols_xml}</tableColumns>'
         f'<tableStyleInfo name="{style}" showFirstColumn="0" showLastColumn="0"'
         ' showRowStripes="1" showColumnStripes="0"/>'
         '</table>'
     ).encode("utf-8")
 
 
-def _patch_xlsx_table(xlsx_path: str, final_row: int) -> None:
+def _patch_xlsx_table(xlsx_path: str, final_row: int, col_names: list) -> None:
     """
     After openpyxl saves, replace its table XML with a clean generated version.
     Reads the table id/name/style from what openpyxl wrote so we don't change
     identifiers, then overwrites only that entry in the zip.
+    col_names must match the actual row-3 header values for every table column.
     """
-    ref = f"A3:G{final_row}"
+    ref = f"A3:J{final_row}"
 
     with zipfile.ZipFile(xlsx_path, "r") as zin:
         table_paths = [n for n in zin.namelist()
@@ -581,6 +595,7 @@ def _patch_xlsx_table(xlsx_path: str, final_row: int) -> None:
         name        = m_name.group(1)        if m_name    else TABLE_DISPLAY_NAME,
         display_name= m_display.group(1)     if m_display else TABLE_DISPLAY_NAME,
         style       = m_style.group(1)       if m_style   else TABLE_STYLE,
+        col_names   = col_names,
     )
 
     buf = io.BytesIO()
@@ -666,17 +681,33 @@ def update_excel(input_path, issues):
 
     _sort_data_rows(ws, api_map)
 
+    # Remove trailing rows that carry fills/borders but no ticket data.
+    # openpyxl counts formatted-but-empty cells toward max_row, so these rows
+    # accumulate across runs unless explicitly deleted.
+    for row_idx in range(ws.max_row, DATA_START_ROW - 1, -1):
+        if any(ws.cell(row=row_idx, column=c).value is not None for c in range(1, 8)):
+            break
+        ws.delete_rows(row_idx)
+
     # Ensure the table covers every row written in this run. _ensure_table_in_model
     # creates the Table object if the file was previously corrupted and Excel had
     # removed it, so openpyxl always writes the worksheet/rels table references.
     # _patch_xlsx_table then replaces openpyxl's generated table XML with a clean
     # version, preventing the Excel repair dialog.
     if ws.max_row >= DATA_START_ROW:
-        _ensure_table_in_model(ws, f"A3:G{ws.max_row}")
+        _ensure_table_in_model(ws, f"A3:J{ws.max_row}")
+
+    # Read the actual row-3 header values for all 10 table columns (A–J).
+    # H–J headers are user-maintained so we take them from the sheet rather than
+    # hardcoding, ensuring the table XML always matches what is visible in the file.
+    table_col_names = [
+        ws.cell(row=3, column=c).value or f"Column{c}"
+        for c in range(1, 11)
+    ]
 
     final_row = ws.max_row
     wb.save(input_path)
-    _patch_xlsx_table(input_path, final_row)
+    _patch_xlsx_table(input_path, final_row, table_col_names)
 
     print(
         f"Saved: {input_path} "
@@ -692,8 +723,8 @@ def main():
     parser.add_argument(
         "input",
         nargs="?",
-        default="Leahi Sprint Management.xlsx",
-        help="Path to the Excel file (default: 'Leahi Sprint Management.xlsx')",
+        default=r"X:\Users\VMShare\VV_Setup\Diality_JIRA_helper\Leahi Sprint Management.xlsx",
+        help="Path to the Excel file",
     )
     args = parser.parse_args()
 
