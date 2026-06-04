@@ -2,19 +2,16 @@ import argparse
 import io
 import os
 import re
-import smtplib
-import traceback
 import zipfile
 import requests
 from copy import copy
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.worksheet.datavalidation import DataValidation
 from datetime import datetime
 
 load_dotenv()
@@ -73,7 +70,7 @@ for _ti, _team in enumerate(TEAMS):
         if _nick:
             _ASSIGNEE_TO_TEAM_IDX[_nick] = _ti
 
-NOTIFICATION_EMAILS = [os.getenv("JIRA_EMAIL")]
+SHAREPOINT_SYNC_PATH = os.getenv("SHAREPOINT_SYNC_PATH", "").strip()
 
 # Font colors for the Type column (C); types not listed use default black
 TYPE_FONT_COLORS = {
@@ -95,11 +92,27 @@ TABLE_STYLE        = "TableStyleMedium2"
 
 MIN_SPRINT = 28  # ignore every sprint before this number
 
+SP_SYNC_COLS = (8, 10)  # H and J only — synced read-only from SharePoint; I is script-controlled
+JIRA_NOTE_RE  = re.compile(r'xlsx<([^>]*)>xlsx')
+
 # Thin vertical separator for white rows — left edge of every column after the first.
 # Green rows use an empty border so the separator only appears on white rows.
 _WHITE_COL_BORDER = Border(left=Side(style="thin", color="E0E0E0"))
 _EMPTY_BORDER     = Border()
 
+VALIDATION_ROW_END    = 1000  # dropdowns cover data rows up to this row
+_SELECTION_SPRINT_MAX = 100   # Selection!F extended up to this sprint number
+
+# Sprint Template column → Selection sheet source range for dropdown validation.
+# Sprint 28 lives at Selection!F29 (row = sprint + 1; row 1 is header).
+_COL_VALIDATIONS = {
+    "A": f"Selection!$F$29:$F${_SELECTION_SPRINT_MAX + 1}",  # Sprint (28+)
+    "B": "Selection!$A$2:$A$26",  # Assignee
+    "C": "Selection!$D$2:$D$6",   # Type (Process Type)
+    "D": "Selection!$H$2:$H$4",   # Scope Changes
+    "E": "Selection!$K$2:$K$3",   # Description (Y/N)
+    "G": "Selection!$E$2:$E$7",   # Status (Ticket Status)
+}
 
 
 # ── Jira fetch ────────────────────────────────────────────────────────────────
@@ -109,7 +122,7 @@ def _fetch_paginated(url, jql, auth):
     start_at = 0
     while True:
         params = {
-            "fields": "summary,status,assignee,issuetype,customfield_10020,description",
+            "fields": "summary,status,assignee,issuetype,customfield_10020,description,comment",
             "expand": "changelog",
             "jql": jql,
             "maxResults": 100,
@@ -157,6 +170,45 @@ def _assignee_nickname(display_name: str) -> str:
     return display_name.split()[0]
 
 
+def _adf_to_text(node) -> str:
+    """Recursively extract plain text from an Atlassian Document Format node or plain string."""
+    if isinstance(node, str):
+        return node
+    if not isinstance(node, dict):
+        return ""
+    if node.get("type") == "text":
+        return node.get("text", "")
+    return "".join(_adf_to_text(c) for c in node.get("content", []))
+
+
+def _latest_jira_note(issue, auth) -> str:
+    """
+    Return the trimmed text from the latest xlsx<...>xlsx comment on this issue, or None.
+    If the main issue fetch returned fewer comments than the total, fetches all comments
+    via the comments endpoint before searching.
+    """
+    comment_field = issue["fields"].get("comment") or {}
+    comments = list(comment_field.get("comments", []))
+    total = comment_field.get("total", len(comments))
+
+    if total > len(comments):
+        url = f"{BASE_URL}/rest/api/2/issue/{issue['key']}/comment"
+        resp = requests.get(url, params={"maxResults": 1000}, auth=auth)
+        resp.raise_for_status()
+        comments = resp.json().get("comments", [])
+
+    best_text = None
+    best_created = ""
+    for comment in comments:
+        body_text = _adf_to_text(comment.get("body") or "")
+        m = JIRA_NOTE_RE.search(body_text)
+        if m and comment.get("created", "") >= best_created:
+            best_created = comment["created"]
+            best_text = m.group(1).strip()
+
+    return best_text
+
+
 def get_jira_issues():
     auth = HTTPBasicAuth(os.getenv("JIRA_EMAIL"), os.getenv("JIRA_API_TOKEN"))
 
@@ -169,8 +221,6 @@ def get_jira_issues():
     seen = {i["key"] for i in board_issues}
 
     # Fetch every backlog issue and keep only those with sprint changelog entries.
-    # This captures tickets that were fully removed from all sprints at any point in history,
-    # not just those removed from the currently active sprint.
     all_backlog = _fetch_paginated(
         f"{BASE_URL}/rest/agile/1.0/board/84/backlog",
         f"project = {PROJECT}",
@@ -181,7 +231,10 @@ def get_jira_issues():
         if i["key"] not in seen and _has_sprint_history(i)
     ]
 
-    return board_issues + backlog_with_history
+    all_issues = board_issues + backlog_with_history
+    for issue in all_issues:
+        issue["_jira_note"] = _latest_jira_note(issue, auth)
+    return all_issues
 
 
 # ── Sprint / issue field helpers ──────────────────────────────────────────────
@@ -242,16 +295,6 @@ def _classify_sprint_timing(sprint, histories):
 
 
 def get_sprint_history(issue):
-    """
-    Return a sorted list of (sprint_num, scope) for every sprint this issue has
-    ever been in — one entry per sprint number, last-state-wins for repeated cycles.
-
-    Scope decision rule:
-      - Sprint is currently in customfield_10020  → ticket was never manually removed
-                                                    → scope = _classify_sprint_timing
-      - Sprint seen ONLY in the changelog         → ticket was manually removed from it
-                                                    → scope = "Move out of Sprint"
-    """
     fields      = issue["fields"]
     histories   = issue["changelog"]["histories"]
     sprint_info = fields.get("customfield_10020") or []
@@ -307,30 +350,6 @@ def get_status(issue):
 
 # ── Notification ──────────────────────────────────────────────────────────────
 
-def _send_notification(subject, body):
-    if not NOTIFICATION_EMAILS:
-        return
-    smtp_host     = os.getenv("SMTP_HOST")
-    smtp_port     = int(os.getenv("SMTP_PORT", 587))
-    smtp_user     = os.getenv("SMTP_USER")
-    smtp_password = os.getenv("SMTP_PASSWORD")
-    smtp_from     = os.getenv("SMTP_FROM")
-    if not all([smtp_host, smtp_user, smtp_password, smtp_from]):
-        print("Warning: SMTP env vars not fully configured, skipping notification.")
-        return
-    msg = MIMEMultipart()
-    msg["From"]    = smtp_from
-    msg["To"]      = ", ".join(NOTIFICATION_EMAILS)
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
-        server.login(smtp_user, smtp_password)
-        server.sendmail(smtp_from, NOTIFICATION_EMAILS, msg.as_string())
-
-
 # ── Sort key ──────────────────────────────────────────────────────────────────
 
 def _issue_sort_key(row_record):
@@ -350,24 +369,19 @@ def _extract_key(label):
 # ── Excel helpers ─────────────────────────────────────────────────────────────
 
 def _ensure_sheet_setup(ws):
-    """
-    Set fonts for rows 1-3, freeze panes at A4, and column widths.
-    Row 1 → Calibri 14 (note banner). Row 2 → Calibri 11 (sprint info).
-    Row 3 headers A–G → Calibri 11 bold, golden yellow fill.
-    """
-    # Row 1: note banner — Calibri 14, preserve existing bold per cell
+    # Row 1: note banner — Calibri 14
     for col in range(1, ws.max_column + 1):
         cell = ws.cell(row=1, column=col)
         if cell.value is not None:
             cell.font = Font(name="Calibri", size=14, bold=bool(cell.font.bold))
 
-    # Row 2: sprint info — Calibri 11, preserve existing bold per cell
+    # Row 2: sprint info — Calibri 11
     for col in range(1, ws.max_column + 1):
         cell = ws.cell(row=2, column=col)
         if cell.value is not None:
             cell.font = Font(name="Calibri", size=11, bold=bool(cell.font.bold))
 
-    header_fill = PatternFill(fill_type="solid", fgColor="FFC000")  # golden yellow
+    header_fill = PatternFill(fill_type="solid", fgColor="FFC000")  
     header_font = Font(name="Calibri", size=11, bold=True)
 
     for col, header in enumerate(SHEET_HEADERS, start=1):
@@ -384,6 +398,34 @@ def _ensure_sheet_setup(ws):
     widths = {"A": 9.29, "B": 10.57, "C": 11.57, "D": 18.43, "F": 103.14, "G": 16.29}
     for col_letter, width in widths.items():
         ws.column_dimensions[col_letter].width = width
+
+
+def _ensure_selection_sprints(wb):
+    """Extend Selection!F sprint list to _SELECTION_SPRINT_MAX if it falls short."""
+    if "Selection" not in wb.sheetnames:
+        return
+    ws_sel = wb["Selection"]
+    for sprint_num in range(1, _SELECTION_SPRINT_MAX + 1):
+        row = sprint_num + 1  # row 1 is header; sprint N lives at row N+1
+        if ws_sel.cell(row=row, column=6).value is None:
+            ws_sel.cell(row=row, column=6).value = sprint_num
+
+
+def _ensure_data_validations(ws):
+    """Apply dropdown validation to cols A-E and G for all data rows."""
+    ws.data_validations.dataValidation = []
+    for col_letter, formula in _COL_VALIDATIONS.items():
+        dv = DataValidation(
+            type="list",
+            formula1=formula,
+            allow_blank=True,
+            showErrorMessage=True,
+            errorTitle="Invalid entry",
+            error="Please select from the dropdown list.",
+            errorStyle="warning",
+        )
+        dv.add(f"{col_letter}{DATA_START_ROW}:{col_letter}{VALIDATION_ROW_END}")
+        ws.add_data_validation(dv)
 
 
 def _row_bg(row_idx):
@@ -409,10 +451,11 @@ def _write_issue_row(ws, row_idx, row_record):
     issue_type   = get_type(issue)
     ticket_url   = f"{BASE_URL}/browse/{key}"
     ticket_label = f"[{key}] {fields.get('summary', '')}"
-    has_description = "Yes" if fields.get("description") else "No"
-    status       = get_status(issue)
+    desc_text       = _adf_to_text(fields.get("description") or "")
+    has_description = "Y" if len(desc_text) > 20 else "N"
+    status          = get_status(issue)
 
-    # Column order: A    B         C           D      E     F             G
+    # Column order: A        B         C           D           E              F         G
     values = [sprint_num, assignee, issue_type, scope, has_description, ticket_label, status]
 
     bg         = _row_bg(row_idx)
@@ -444,6 +487,15 @@ def _write_issue_row(ws, row_idx, row_record):
             cell.font      = Font(name="Calibri", size=11)
             cell.hyperlink = None
 
+    # Column I (9) — latest xlsx<...>xlsx Jira comment; skipped when None (leaves existing value)
+    jira_note = row_record.get("jira_note")
+    if jira_note is not None:
+        cell_i           = ws.cell(row=row_idx, column=9, value=jira_note)
+        cell_i.alignment = base_align
+        cell_i.fill      = PatternFill(fill_type="solid", fgColor=bg)
+        cell_i.font      = Font(name="Calibri", size=11)
+        cell_i.hyperlink = None
+
 
 def _apply_alternating_fills(ws):
     """
@@ -463,12 +515,6 @@ def _apply_alternating_fills(ws):
 
 
 def _sort_data_rows(ws, api_map):
-    """
-    Sort all data rows (row 4+) by (sprint_num, team_idx, assignee).
-    api_map is keyed by (jira_key, sprint_num) — the composite row identity.
-    Reads every column so that manually maintained H+ data moves with its row.
-    Re-applies alternating fills after sorting.
-    """
     max_row = ws.max_row
     if max_row < DATA_START_ROW:
         return
@@ -522,17 +568,6 @@ def _sort_data_rows(ws, api_map):
 
     # Fills are position-dependent; re-apply after rows have moved
     _apply_alternating_fills(ws)
-
-
-# ── Table XML preservation ────────────────────────────────────────────────────
-# openpyxl regenerates table XML on save using only the attributes it knows,
-# silently dropping others. A snapshot-and-restore strategy has a silent failure
-# mode: if the source file is already corrupt (e.g. Excel previously repaired it
-# by removing the table), the snapshot is empty and the restore is a no-op.
-#
-# Instead we let openpyxl write the table so the worksheet XML and relationship
-# files stay correct, then replace only xl/tables/table1.xml with a freshly
-# generated version that is always structurally valid.
 
 def _ensure_table_in_model(ws, new_ref: str) -> None:
     """Update the existing table ref, or create a minimal Table if none exists."""
@@ -627,6 +662,8 @@ def update_excel(input_path, issues):
     ws = wb[SHEET_NAME]
 
     _ensure_sheet_setup(ws)
+    _ensure_selection_sprints(wb)
+    _ensure_data_validations(ws)
 
     # Build api_map: (jira_key, sprint_num) → row_record
     # Each issue expands into one row_record per sprint it has ever been in.
@@ -634,7 +671,7 @@ def update_excel(input_path, issues):
     for issue in issues:
         for sprint_num, scope in get_sprint_history(issue):
             composite        = (issue["key"], sprint_num)
-            api_map[composite] = {"issue": issue, "sprint_num": sprint_num, "scope": scope}
+            api_map[composite] = {"issue": issue, "sprint_num": sprint_num, "scope": scope, "jira_note": issue.get("_jira_note")}
 
     # Build existing map: (jira_key, sprint_num) → [row_idx, ...]
     # Using col F for the Jira key and col A for the sprint number.
@@ -716,6 +753,51 @@ def update_excel(input_path, issues):
     )
 
 
+def _is_file_locked(path: str) -> bool:
+    try:
+        with open(path, "r+b"):
+            return False
+    except (PermissionError, OSError):
+        return True
+
+
+def _sync_hplus(source_path: str, dest_path: str) -> None:
+    """
+    Read H–J note values from source (SharePoint) and write them into dest (X: drive),
+    matched by (jira_key, sprint_num). SharePoint is the source of truth — even empty
+    cells in source overwrite dest so deleted notes don't linger on the X: drive copy.
+    """
+    wb_src = load_workbook(source_path, data_only=True)
+    ws_src = wb_src[SHEET_NAME]
+    hplus_map = {}
+    for row_idx in range(DATA_START_ROW, ws_src.max_row + 1):
+        key = _extract_key(ws_src.cell(row=row_idx, column=6).value)
+        try:
+            sprint_num = int(ws_src.cell(row=row_idx, column=1).value)
+        except (TypeError, ValueError):
+            sprint_num = None
+        if key and sprint_num is not None:
+            hplus_map[(key, sprint_num)] = tuple(
+                ws_src.cell(row=row_idx, column=c).value for c in SP_SYNC_COLS
+            )
+
+    wb_dst = load_workbook(dest_path)
+    ws_dst = wb_dst[SHEET_NAME]
+    for row_idx in range(DATA_START_ROW, ws_dst.max_row + 1):
+        key = _extract_key(ws_dst.cell(row=row_idx, column=6).value)
+        try:
+            sprint_num = int(ws_dst.cell(row=row_idx, column=1).value)
+        except (TypeError, ValueError):
+            sprint_num = None
+        if key and sprint_num is not None:
+            vals = hplus_map.get((key, sprint_num))
+            if vals is not None:
+                for col_idx, val in zip(SP_SYNC_COLS, vals):
+                    ws_dst.cell(row=row_idx, column=col_idx).value = val
+    wb_dst.save(dest_path)
+    print(f"H/J notes synced from SharePoint → X: drive ({len(hplus_map)} rows read)")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Update Leahi Sprint Management Excel from Jira."
@@ -728,23 +810,24 @@ def main():
     )
     args = parser.parse_args()
 
-    try:
-        print("Fetching issues from Jira...")
-        issues = get_jira_issues()
-        print(f"Found {len(issues)} issues")
-        print("Updating Excel...")
-        update_excel(args.input, issues)
-        print("Done!")
-        _send_notification(
-            "Sprint Management: Success",
-            f"Script ran successfully.\n{len(issues)} tickets processed.",
+    if not SHAREPOINT_SYNC_PATH:
+        raise RuntimeError(
+            "SHAREPOINT_SYNC_PATH is not set in .env. "
+            "Set it to the Linux path of your OneDrive-synced SharePoint file."
         )
-    except Exception:
-        _send_notification(
-            "Sprint Management: Failed",
-            f"Script failed with the following error:\n\n{traceback.format_exc()}",
+
+    if _is_file_locked(SHAREPOINT_SYNC_PATH):
+        raise RuntimeError(
+            "SharePoint file is currently open or locked — close it in Excel and re-run."
         )
-        raise
+
+    print("Fetching issues from Jira...")
+    issues = get_jira_issues()
+    print(f"Found {len(issues)} issues")
+    print("Updating Sprint Template on X: drive...")
+    update_excel(args.input, issues)
+    print("Syncing H-J notes from SharePoint to X: drive...")
+    _sync_hplus(SHAREPOINT_SYNC_PATH, args.input)
 
 
 if __name__ == "__main__":
