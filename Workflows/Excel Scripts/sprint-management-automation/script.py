@@ -27,10 +27,11 @@ DATA_START_ROW = 4  # Row 1=note banner, Row 2=sprint info, Row 3=headers, Row 4
 SWVV_TEAM = ["Raghu Kallala", "Thomas Lippold", "Tejaskumar Patel", "Tiffany Mejia",
              "Zoltan Miskolci", "Sarina Cheung", "Tisha Patel", "Ethan Nguyen"]
 FW_TEAM   = ["Arpita Srivastava", "Jashwant Gantyada", "Michael Garthwaite", "Praneeth Bunne",
-             "Sameer Poyil", "Varshini Nagabooshanam", "Vijay Pamula", "Suresh Dharnala"]
-SW_TEAM   = ["Nicholas Ramirez", "Stephen Quong", "Dara Navaei",
-             "Eliza Petersen", "Christina Heine", "Caitlynn Chang"]
-TEAMS = [SWVV_TEAM, FW_TEAM, SW_TEAM]
+             "Sameer Poyil", "Varshini Nagabooshanam", "Vijay Pamula", "Suresh Dharnala", "Santhos Kumar Reddy", 
+             "Vinayakam Mani"]
+SW_TEAM   = ["Nicholas Ramirez", "Stephen Quong", "Dara Navaei", "Sean Nash", "Behrouz NematiPour"]
+SYS_TEAM  = ["Eliza Petersen", "Caitlynn Chang", "Christina Heine"]
+TEAMS = [FW_TEAM, SWVV_TEAM, SW_TEAM, SYS_TEAM]
 
 # Full Jira display name → nickname used in the Selection sheet dropdowns.
 # Non-obvious entries are listed first; straightforward first-name entries follow.
@@ -38,7 +39,7 @@ NICKNAME_MAP = {
     "Tejaskumar Patel":       "Tejas",
     "Nicholas Ramirez":       "Nico",
     "Thomas Lippold":         "Tom",
-    "Jashwant Gantyada":      "Jaswant",       # Jira spells with 'h'; Selection does not
+    "Jashwant Gantyada":      "Jashwant",       
     "Behrouz NematiPour":     "Behrouz",
     "Sean Nash":              "Sean",
     "Vinayakam Mani":         "Vinay",
@@ -60,11 +61,10 @@ NICKNAME_MAP = {
     "Stephen Quong":          "Stephen",
     "Christina Heine":        "Christina",
     "Caitlynn Chang":         "Caitlynn",
+    "Santhos Kumar Reddy":    "Santhos"
 }
 
 # Lookup from assignee name (full Jira OR nickname) → team sort index.
-# Populated at import time so the sort fallback path works when only the cell
-# nickname is available (the api_map lookup path uses the full Jira name directly).
 _ASSIGNEE_TO_TEAM_IDX: dict = {}
 for _ti, _team in enumerate(TEAMS):
     for _full in _team:
@@ -723,7 +723,7 @@ def main():
     parser.add_argument(
         "input",
         nargs="?",
-        default=r"X:\Users\VMShare\VV_Setup\Diality_JIRA_helper\Leahi Sprint Management.xlsx",
+        default=os.getenv("EXCEL_PATH"),
         help="Path to the Excel file",
     )
     args = parser.parse_args()
