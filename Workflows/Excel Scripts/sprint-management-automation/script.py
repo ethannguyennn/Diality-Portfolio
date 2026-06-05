@@ -4,7 +4,6 @@ import os
 import re
 import zipfile
 import requests
-from copy import copy
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 from openpyxl import load_workbook
@@ -25,9 +24,9 @@ SWVV_TEAM = ["Raghu Kallala", "Thomas Lippold", "Tejaskumar Patel", "Tiffany Mej
              "Zoltan Miskolci", "Sarina Cheung", "Tisha Patel", "Ethan Nguyen"]
 FW_TEAM   = ["Arpita Srivastava", "Jashwant Gantyada", "Michael Garthwaite", "Praneeth Bunne",
              "Sameer Poyil", "Varshini Nagabooshanam", "Vijay Pamula", "Suresh Dharnala", "Santhos Kumar Reddy", 
-             "Vinayakam Mani"]
-SW_TEAM   = ["Nicholas Ramirez", "Stephen Quong", "Dara Navaei", "Sean Nash", "Behrouz NematiPour"]
-SYS_TEAM  = ["Eliza Petersen", "Caitlynn Chang", "Christina Heine"]
+             "Vinayakam Mani", "Sean Nash"]
+SW_TEAM   = ["Nicholas Ramirez", "Stephen Quong", "Dara Navaei", "Behrouz NematiPour"]
+SYS_TEAM  = ["Eliza Petersen", "Caitlynn Chang", "Christina Heine", "Abhijit Barman", "Chris Yu", "Vitas Buenaventura"]
 TEAMS = [FW_TEAM, SWVV_TEAM, SW_TEAM, SYS_TEAM]
 
 # Full Jira display name → nickname used in the Selection sheet dropdowns.
@@ -58,7 +57,10 @@ NICKNAME_MAP = {
     "Stephen Quong":          "Stephen",
     "Christina Heine":        "Christina",
     "Caitlynn Chang":         "Caitlynn",
-    "Santhos Kumar Reddy":    "Santhos"
+    "Santhos Kumar Reddy":    "Santhos",
+    "Abhijit Barman":         "Abhijit",
+    "Chris Yu":              "Chris",
+    "Vitas Buenaventura":     "Vitas",
 }
 
 # Lookup from assignee name (full Jira OR nickname) → team sort index.
@@ -294,7 +296,38 @@ def _classify_sprint_timing(sprint, histories):
     return "Added" if most_recent_add > sprint_start_eod else "Scoped"
 
 
-def get_sprint_history(issue):
+def _determine_current_sprint_num(issues, ws) -> int:
+    """
+    Determine the current sprint number using three fallbacks in order:
+      1. Highest active sprint from the Jira API.
+      2. Sprint number in cell B2 of the worksheet (manually maintained).
+      3. Highest closed sprint from the Jira API.
+    """
+    active, closed = [], []
+    for issue in issues:
+        for s in (issue["fields"].get("customfield_10020") or []):
+            num   = _sprint_num(s.get("name", ""))
+            state = s.get("state", "")
+            if num < MIN_SPRINT:
+                continue
+            if state == "active":
+                active.append(num)
+            elif state == "closed":
+                closed.append(num)
+    if active:
+        return max(active)
+    try:
+        b2 = int(ws.cell(row=2, column=2).value)
+        if b2 >= MIN_SPRINT:
+            return b2
+    except (TypeError, ValueError):
+        pass
+    if closed:
+        return max(closed)
+    return MIN_SPRINT
+
+
+def get_sprint_history(issue, current_sprint_num):
     fields      = issue["fields"]
     histories   = issue["changelog"]["histories"]
     sprint_info = fields.get("customfield_10020") or []
@@ -315,11 +348,13 @@ def get_sprint_history(issue):
 
     sprint_entries = {}  # sprint_num → scope
 
-    # Pass 1: changelog-only sprints → ticket was manually removed from each
+    # Pass 1: changelog-only sprints → ticket was manually removed from each.
+    # Only label as "Move out of Sprint" for current sprint and earlier; future sprint
+    # removals are skipped entirely since those issues were never discussed in that sprint.
     for name in all_sprint_names:
         if name not in current_sprint_names:
             num = _sprint_num(name)
-            if num >= MIN_SPRINT:
+            if num >= MIN_SPRINT and num <= current_sprint_num:
                 sprint_entries[num] = "Move out of Sprint"
 
     # Pass 2: currently-held sprints → timing classification overwrites any conflict
@@ -346,18 +381,6 @@ def get_status(issue):
         return "Done"
     else:
         return "Not started"
-
-
-# ── Notification ──────────────────────────────────────────────────────────────
-
-# ── Sort key ──────────────────────────────────────────────────────────────────
-
-def _issue_sort_key(row_record):
-    sprint_num = row_record["sprint_num"]
-    fields     = row_record["issue"]["fields"]
-    assignee   = fields["assignee"]["displayName"] if fields.get("assignee") else ""
-    team_idx   = next((i for i, team in enumerate(TEAMS) if assignee in team), len(TEAMS))
-    return (sprint_num, team_idx, assignee)
 
 
 def _extract_key(label):
@@ -497,12 +520,13 @@ def _write_issue_row(ws, row_idx, row_record):
         cell_i.hyperlink = None
 
 
-def _apply_alternating_fills(ws):
+def _apply_alternating_fills(ws, start_row=DATA_START_ROW):
     """
-    Re-apply position-based alternating fills to columns A–J (1–10) after a sort.
-    K, L, M are unused and left blank. Only fill is changed; H–J values/fonts untouched.
+    Re-apply position-based alternating fills to columns A–J (1–10).
+    K+ are unused and left blank. Only fill is changed; H–J values/fonts untouched.
+    Pass start_row to limit re-application to current sprint onward, leaving past rows intact.
     """
-    for row_idx in range(DATA_START_ROW, ws.max_row + 1):
+    for row_idx in range(start_row, ws.max_row + 1):
         if not any(ws.cell(row=row_idx, column=c).value is not None for c in range(1, 11)):
             continue  # skip rows with no content in A–J
 
@@ -513,61 +537,6 @@ def _apply_alternating_fills(ws):
             cell.fill   = PatternFill(fill_type="solid", fgColor=bg)
             cell.border = _WHITE_COL_BORDER if (bg == "FFFFFF" and col > 1) else _EMPTY_BORDER
 
-
-def _sort_data_rows(ws, api_map):
-    max_row = ws.max_row
-    if max_row < DATA_START_ROW:
-        return
-
-    max_col   = ws.max_column
-    rows_data = []
-
-    for row_idx in range(DATA_START_ROW, max_row + 1):
-        cells = []
-        for col_idx in range(1, max_col + 1):
-            cell = ws.cell(row=row_idx, column=col_idx)
-            cells.append({
-                "value":     cell.value,
-                "hyperlink": cell.hyperlink.target if cell.hyperlink else None,
-                "font":      copy(cell.font),
-                "fill":      copy(cell.fill),
-                "alignment": copy(cell.alignment),
-            })
-
-        # col F (0-based index 5) = "[LDT-XXXX] Summary"; col A (index 0) = sprint number
-        key = _extract_key(cells[5]["value"])
-        try:
-            sprint_num = int(cells[0]["value"]) if cells[0]["value"] is not None else None
-        except (ValueError, TypeError):
-            sprint_num = None
-
-        composite = (key, sprint_num) if key and sprint_num is not None else None
-
-        if composite and composite in api_map:
-            sort_key = _issue_sort_key(api_map[composite])
-        else:
-            sn       = sprint_num if sprint_num is not None else 9999
-            assignee = cells[1]["value"] or ""
-            # Cell holds the nickname; _ASSIGNEE_TO_TEAM_IDX handles both full names and
-            # nicknames so manually entered or old rows still sort into the right team bucket.
-            team_idx = _ASSIGNEE_TO_TEAM_IDX.get(assignee, len(TEAMS))
-            sort_key = (sn, team_idx, assignee)
-
-        rows_data.append((sort_key, cells))
-
-    rows_data.sort(key=lambda x: x[0])
-
-    for row_idx, (_, cells) in enumerate(rows_data, start=DATA_START_ROW):
-        for col_idx, cd in enumerate(cells, start=1):
-            cell           = ws.cell(row=row_idx, column=col_idx)
-            cell.value     = cd["value"]
-            cell.font      = cd["font"]
-            cell.fill      = cd["fill"]
-            cell.alignment = cd["alignment"]
-            cell.hyperlink = cd["hyperlink"]
-
-    # Fills are position-dependent; re-apply after rows have moved
-    _apply_alternating_fills(ws)
 
 def _ensure_table_in_model(ws, new_ref: str) -> None:
     """Update the existing table ref, or create a minimal Table if none exists."""
@@ -644,6 +613,35 @@ def _patch_xlsx_table(xlsx_path: str, final_row: int, col_names: list) -> None:
 
 # ── Main update logic ─────────────────────────────────────────────────────────
 
+def _insert_point_for_sprint(ws, sprint_num):
+    """
+    Return the row index after which new rows for sprint_num should be inserted.
+    Scans for the last row where col-A sprint number <= sprint_num; new rows go after it.
+    If no such row exists, returns DATA_START_ROW - 1 so rows are inserted at the top.
+    """
+    result = DATA_START_ROW - 1
+    for row_idx in range(DATA_START_ROW, ws.max_row + 1):
+        try:
+            n = int(ws.cell(row=row_idx, column=1).value)
+        except (TypeError, ValueError):
+            continue
+        if n <= sprint_num:
+            result = row_idx
+    return result
+
+
+def _first_current_row_idx(ws, current_sprint_num):
+    """Return the first row index with sprint >= current_sprint_num, or ws.max_row + 1."""
+    for row_idx in range(DATA_START_ROW, ws.max_row + 1):
+        try:
+            n = int(ws.cell(row=row_idx, column=1).value)
+        except (TypeError, ValueError):
+            continue
+        if n >= current_sprint_num:
+            return row_idx
+    return ws.max_row + 1
+
+
 def update_excel(input_path, issues):
     if not os.path.exists(input_path):
         raise FileNotFoundError(
@@ -665,78 +663,104 @@ def update_excel(input_path, issues):
     _ensure_selection_sprints(wb)
     _ensure_data_validations(ws)
 
-    # Build api_map: (jira_key, sprint_num) → row_record
-    # Each issue expands into one row_record per sprint it has ever been in.
+    # Determine the boundary sprint. Rows for sprints before this are never touched.
+    current_sprint_num = _determine_current_sprint_num(issues, ws)
+
+    # Build api_map for current sprint and beyond only.
+    # "Move out of Sprint" entries are excluded: the Remove operation handles those
+    # by marking existing spreadsheet rows rather than inserting new changelog rows.
     api_map = {}
     for issue in issues:
-        for sprint_num, scope in get_sprint_history(issue):
-            composite        = (issue["key"], sprint_num)
-            api_map[composite] = {"issue": issue, "sprint_num": sprint_num, "scope": scope, "jira_note": issue.get("_jira_note")}
+        for sprint_num, scope in get_sprint_history(issue, current_sprint_num):
+            if sprint_num < current_sprint_num or scope == "Move out of Sprint":
+                continue
+            composite = (issue["key"], sprint_num)
+            api_map[composite] = {
+                "issue":      issue,
+                "sprint_num": sprint_num,
+                "scope":      scope,
+                "jira_note":  issue.get("_jira_note"),
+            }
 
-    # Build existing map: (jira_key, sprint_num) → [row_idx, ...]
-    # Using col F for the Jira key and col A for the sprint number.
-    # A list per composite handles accidental duplicates from prior edits.
-    existing = {}
+    # Build existing map for current sprint and beyond only.
+    # Past sprint rows (sprint < current_sprint_num) are completely skipped.
+    existing = {}  # composite → [row_idx, ...]
     for row_idx in range(DATA_START_ROW, ws.max_row + 1):
-        label      = ws.cell(row=row_idx, column=6).value  # col F
-        sprint_val = ws.cell(row=row_idx, column=1).value  # col A
+        label      = ws.cell(row=row_idx, column=6).value
+        sprint_val = ws.cell(row=row_idx, column=1).value
         key        = _extract_key(label)
         try:
             sprint_num = int(sprint_val) if sprint_val is not None else None
         except (ValueError, TypeError):
             sprint_num = None
-        if key and sprint_num is not None:
-            composite = (key, sprint_num)
-            existing.setdefault(composite, []).append(row_idx)
+        if key and sprint_num is not None and sprint_num >= current_sprint_num:
+            existing.setdefault((key, sprint_num), []).append(row_idx)
 
-    # Update the first (topmost) occurrence of each composite that is still in the API
+    # ── UPDATE ────────────────────────────────────────────────────────────────
+    # Rows present in both the spreadsheet and the API: refresh all fields.
+    # Rows already marked "Move out of Sprint" are frozen and skipped entirely.
     updated = set()
     for composite, row_indices in existing.items():
         if composite in api_map:
-            _write_issue_row(ws, row_indices[0], api_map[composite])
+            row_idx = row_indices[0]
+            if ws.cell(row=row_idx, column=4).value == "Move out of Sprint":
+                updated.add(composite)
+                continue
+            _write_issue_row(ws, row_idx, api_map[composite])
             updated.add(composite)
 
-    # Delete stale composites (gone from API) and duplicate rows (beyond the first).
-    # Always delete in reverse row order so indices of earlier rows are not shifted.
-    removed_count = sum(1 for c in existing if c not in api_map)
-    to_delete = []
+    # ── REMOVE ───────────────────────────────────────────────────────────────
+    # Rows in the spreadsheet that are no longer in the Jira API for that sprint:
+    # write "Move out of Sprint" into column D and leave every other cell untouched.
+    # Already-marked rows are skipped so they are never overwritten again.
+    removed_count = 0
     for composite, row_indices in existing.items():
         if composite not in api_map:
-            to_delete.extend(row_indices)        # all rows for a gone (key, sprint)
-        else:
-            to_delete.extend(row_indices[1:])    # duplicate rows beyond the first
+            row_idx = row_indices[0]
+            if ws.cell(row=row_idx, column=4).value != "Move out of Sprint":
+                ws.cell(row=row_idx, column=4).value = "Move out of Sprint"
+                removed_count += 1
+
+    # Delete duplicate rows (beyond the first occurrence) for current+ composites.
+    # Always process in reverse order so earlier row indices are not shifted.
+    to_delete = []
+    for row_indices in existing.values():
+        to_delete.extend(row_indices[1:])
     to_delete.sort(reverse=True)
     for row_idx in to_delete:
         ws.delete_rows(row_idx)
 
-    # Append rows for (key, sprint) pairs not yet in the sheet
+    # ── ADD ───────────────────────────────────────────────────────────────────
+    # Tickets in the API with no row in the spreadsheet yet: insert at the bottom
+    # of their sprint's section. Sprints are processed in reverse order so that
+    # insertions at later sprints do not shift the insert points for earlier ones.
     new_composites = [c for c in api_map if c not in existing]
-    next_row = ws.max_row + 1
+    new_by_sprint: dict = {}
     for composite in new_composites:
-        _write_issue_row(ws, next_row, api_map[composite])
-        next_row += 1
+        new_by_sprint.setdefault(composite[1], []).append(composite)
 
-    _sort_data_rows(ws, api_map)
+    for sprint_num in sorted(new_by_sprint.keys(), reverse=True):
+        insert_after = _insert_point_for_sprint(ws, sprint_num)
+        n = len(new_by_sprint[sprint_num])
+        ws.insert_rows(insert_after + 1, n)
+        for j, composite in enumerate(new_by_sprint[sprint_num]):
+            _write_issue_row(ws, insert_after + 1 + j, api_map[composite])
+
+    # Re-apply position-based alternating fills from the first current-sprint row
+    # onward. Past sprint rows are completely untouched.
+    first_current = _first_current_row_idx(ws, current_sprint_num)
+    if first_current <= ws.max_row:
+        _apply_alternating_fills(ws, start_row=first_current)
 
     # Remove trailing rows that carry fills/borders but no ticket data.
-    # openpyxl counts formatted-but-empty cells toward max_row, so these rows
-    # accumulate across runs unless explicitly deleted.
     for row_idx in range(ws.max_row, DATA_START_ROW - 1, -1):
         if any(ws.cell(row=row_idx, column=c).value is not None for c in range(1, 8)):
             break
         ws.delete_rows(row_idx)
 
-    # Ensure the table covers every row written in this run. _ensure_table_in_model
-    # creates the Table object if the file was previously corrupted and Excel had
-    # removed it, so openpyxl always writes the worksheet/rels table references.
-    # _patch_xlsx_table then replaces openpyxl's generated table XML with a clean
-    # version, preventing the Excel repair dialog.
     if ws.max_row >= DATA_START_ROW:
         _ensure_table_in_model(ws, f"A3:J{ws.max_row}")
 
-    # Read the actual row-3 header values for all 10 table columns (A–J).
-    # H–J headers are user-maintained so we take them from the sheet rather than
-    # hardcoding, ensuring the table XML always matches what is visible in the file.
     table_col_names = [
         ws.cell(row=3, column=c).value or f"Column{c}"
         for c in range(1, 11)
@@ -748,9 +772,11 @@ def update_excel(input_path, issues):
 
     print(
         f"Saved: {input_path} "
-        f"({len(api_map)} sprint-rows across {len(issues)} tickets | "
-        f"{len(updated)} updated, {len(new_composites)} added, {removed_count} removed)"
+        f"(current sprint: {current_sprint_num} | "
+        f"{len(api_map)} active sprint-rows across {len(issues)} tickets | "
+        f"{len(updated)} updated, {len(new_composites)} added, {removed_count} marked removed)"
     )
+    return current_sprint_num
 
 
 def _is_file_locked(path: str) -> bool:
