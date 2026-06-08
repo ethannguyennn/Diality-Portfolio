@@ -2,6 +2,7 @@ import argparse
 import io
 import os
 import re
+import uuid
 import zipfile
 import requests
 from requests.auth import HTTPBasicAuth
@@ -9,8 +10,9 @@ from dotenv import load_dotenv
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment
 
-from openpyxl.worksheet.table import Table, TableStyleInfo
-from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.table import Table, TableStyleInfo, TableColumn
+from openpyxl.utils import range_boundaries
+from openpyxl.worksheet.datavalidation import DataValidation, DataValidationList
 from datetime import datetime
 
 load_dotenv()
@@ -403,7 +405,7 @@ def _ensure_selection_sprints(wb):
 
 def _ensure_data_validations(ws):
     """Apply dropdown validation to cols A-E and G for all data rows."""
-    ws.data_validations.dataValidation = []
+    ws.data_validations = DataValidationList()
     for col_letter, formula in _COL_VALIDATIONS.items():
         dv = DataValidation(
             type="list",
@@ -522,35 +524,77 @@ def _ensure_table_in_model(ws, new_ref: str) -> None:
     else:
         tbl = Table(displayName=TABLE_DISPLAY_NAME, ref=new_ref)
         tbl.tableStyleInfo = TableStyleInfo(name=TABLE_STYLE, showRowStripes=True)
+        min_col, _, max_col, _ = range_boundaries(new_ref)
+        tbl.tableColumns = [
+            TableColumn(
+                id=i,
+                name=str(cell_val) if (cell_val := ws.cell(row=3, column=col).value) and str(cell_val).strip()
+                     else f"Column{col}"
+            )
+            for i, col in enumerate(range(min_col, max_col + 1), start=1)
+        ]
         ws.add_table(tbl)
 
 
-def _generate_table_xml(ref: str, tbl_id: int, name: str, display_name: str, style: str,
-                        col_names: list) -> bytes:
-    """Build a complete, valid OOXML table definition for the given ref and column list."""
+
+def _xml_attr(value: str) -> str:
+    return (value.replace("&", "&amp;").replace("<", "&lt;")
+                 .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _generate_table_xml(ref: str, col_names: list, uid: str = None) -> bytes:
+    """
+    Build a complete OOXML table1.xml with proper namespace declarations and xr:uid.
+    xr:uid is required by SharePoint/Excel 365 to avoid the 'Repaired Records' dialog.
+    If uid is provided (extracted from a previous version of the file) it is reused so
+    the table identity stays stable across script runs.
+    """
+    xr_uid = uid or ("{" + str(uuid.uuid4()).upper() + "}")
     cols_xml = "".join(
-        f'<tableColumn id="{i + 1}" name="{col}"/>'
-        for i, col in enumerate(col_names)
+        f'<tableColumn id="{i + 1}" name="{_xml_attr(n)}"/>'
+        for i, n in enumerate(col_names)
     )
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
-        f' id="{tbl_id}" name="{name}" displayName="{display_name}"'
-        f' ref="{ref}" totalsRowShown="0">'
+        ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"'
+        ' xmlns:xr="http://schemas.microsoft.com/office/spreadsheetml/2014/revision"'
+        ' xmlns:xr3="http://schemas.microsoft.com/office/spreadsheetml/2016/revision3"'
+        ' mc:Ignorable="xr xr3"'
+        f' id="1" name="{TABLE_DISPLAY_NAME}" displayName="{TABLE_DISPLAY_NAME}"'
+        f' ref="{ref}" totalsRowShown="0" xr:uid="{xr_uid}">'
         f'<autoFilter ref="{ref}"/>'
         f'<tableColumns count="{len(col_names)}">{cols_xml}</tableColumns>'
-        f'<tableStyleInfo name="{style}" showFirstColumn="0" showLastColumn="0"'
+        f'<tableStyleInfo name="{TABLE_STYLE}" showFirstColumn="0" showLastColumn="0"'
         ' showRowStripes="1" showColumnStripes="0"/>'
         '</table>'
     ).encode("utf-8")
 
 
-def _patch_xlsx_table(xlsx_path: str, final_row: int, col_names: list) -> None:
+def _capture_table_xml(xlsx_path: str) -> tuple:
     """
-    After openpyxl saves, replace its table XML with a clean generated version.
-    Reads the table id/name/style from what openpyxl wrote so we don't change
-    identifiers, then overwrites only that entry in the zip.
-    col_names must match the actual row-3 header values for every table column.
+    Read the original table XML from the xlsx zip BEFORE openpyxl loads it.
+    Returns (zip_entry_path, xml_str) or (None, None) if no table found.
+    Preserving the original lets _patch_xlsx_table keep Excel-specific attributes
+    (xr3:uid, namespace declarations, etc.) that openpyxl silently drops on save.
+    """
+    with zipfile.ZipFile(xlsx_path, "r") as z:
+        table_paths = [n for n in z.namelist()
+                       if n.startswith("xl/tables/") and n.endswith(".xml")]
+        if not table_paths:
+            return None, None
+        table_path = table_paths[0]
+        return table_path, z.read(table_path).decode("utf-8", errors="replace")
+
+
+def _patch_xlsx_table(xlsx_path: str, final_row: int,
+                      orig_table_xml: str = None, col_names: list = None) -> None:
+    """
+    After openpyxl saves, replace table1.xml with a clean, fully-formed version.
+    col_names drives _generate_table_xml, which writes proper namespace declarations
+    and xr:uid — the attributes SharePoint requires to avoid the repair dialog.
+    xr:uid is extracted from orig_table_xml (or openpyxl's output) when available so
+    the table identity stays stable across runs.
     """
     ref = f"A3:K{final_row}"
 
@@ -564,18 +608,9 @@ def _patch_xlsx_table(xlsx_path: str, final_row: int, col_names: list) -> None:
         raw_xml    = zin.read(table_path).decode("utf-8", errors="replace")
         entries    = [(info, zin.read(info.filename)) for info in zin.infolist()]
 
-    m_id      = re.search(r'\bid="(\d+)"',                   raw_xml)
-    m_name    = re.search(r'<table\b[^>]+\bname="([^"]+)"',  raw_xml)
-    m_display = re.search(r'\bdisplayName="([^"]+)"',         raw_xml)
-
-    clean_xml = _generate_table_xml(
-        ref,
-        tbl_id      = int(m_id.group(1))    if m_id      else 1,
-        name        = m_name.group(1)        if m_name    else TABLE_DISPLAY_NAME,
-        display_name= m_display.group(1)     if m_display else TABLE_DISPLAY_NAME,
-        style       = TABLE_STYLE,
-        col_names   = col_names,
-    )
+    source = orig_table_xml or raw_xml
+    uid_m  = re.search(r'xr:uid="([^"]*)"', source)
+    clean_xml = _generate_table_xml(ref, col_names or [], uid=uid_m.group(1) if uid_m else None)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -628,6 +663,8 @@ def update_excel(input_path, issues):
             f"Required file not found: '{input_path}'. "
             "Ensure 'Leahi Sprint Management.xlsx' exists in the working directory."
         )
+
+    _, orig_table_xml = _capture_table_xml(input_path)
 
     wb = load_workbook(input_path)
 
@@ -751,17 +788,19 @@ def update_excel(input_path, issues):
             break
         ws.delete_rows(row_idx)
 
-    if ws.max_row >= DATA_START_ROW:
-        _ensure_table_in_model(ws, f"A3:K{ws.max_row}")
+    final_row = ws.max_row
 
-    table_col_names = [
-        ws.cell(row=3, column=c).value or f"Column{c}"
+    if final_row >= DATA_START_ROW:
+        _ensure_table_in_model(ws, f"A3:K{final_row}")
+
+    col_names = [
+        str(v) if (v := ws.cell(row=3, column=c).value) and str(v).strip() else f"Column{c}"
         for c in range(1, 12)
     ]
 
-    final_row = ws.max_row
     wb.save(input_path)
-    _patch_xlsx_table(input_path, final_row, table_col_names)
+
+    _patch_xlsx_table(input_path, final_row, orig_table_xml, col_names)
 
     print(
         f"Saved: {input_path} "
@@ -801,6 +840,8 @@ def _sync_hplus(source_path: str, dest_path: str) -> None:
                 ws_src.cell(row=row_idx, column=c).value for c in SP_SYNC_COLS
             )
 
+    _, dest_table_xml = _capture_table_xml(dest_path)
+
     wb_dst = load_workbook(dest_path)
     ws_dst = wb_dst[SHEET_NAME]
     for row_idx in range(DATA_START_ROW, ws_dst.max_row + 1):
@@ -814,7 +855,14 @@ def _sync_hplus(source_path: str, dest_path: str) -> None:
             if vals is not None:
                 for col_idx, val in zip(SP_SYNC_COLS, vals):
                     ws_dst.cell(row=row_idx, column=col_idx).value = val
+
+    final_row = ws_dst.max_row
+    col_names = [
+        str(v) if (v := ws_dst.cell(row=3, column=c).value) and str(v).strip() else f"Column{c}"
+        for c in range(1, 12)
+    ]
     wb_dst.save(dest_path)
+    _patch_xlsx_table(dest_path, final_row, dest_table_xml, col_names)
     print(f"H/J notes synced from SharePoint -> X: drive ({len(hplus_map)} rows read)")
 
 
