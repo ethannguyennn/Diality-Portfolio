@@ -642,6 +642,23 @@ def _first_current_row_idx(ws, current_sprint_num):
     return ws.max_row + 1
 
 
+def _sprint_started(sprint_num: int, sprint_map: dict) -> bool:
+    """Return True if the sprint has started (active or closed), False if future/unstarted."""
+    s = sprint_map.get(sprint_num)
+    if not s:
+        return True  # unknown sprint — safe default is to treat as started
+    state = s.get("state", "")
+    if state in ("active", "closed"):
+        return True
+    if state == "future":
+        return False
+    # Unknown state — fall back to startDate comparison
+    start_dt = parse_date(s.get("startDate"))
+    if not start_dt:
+        return False
+    return datetime.now(start_dt.tzinfo) >= start_dt
+
+
 def update_excel(input_path, issues):
     if not os.path.exists(input_path):
         raise FileNotFoundError(
@@ -665,6 +682,14 @@ def update_excel(input_path, issues):
 
     # Determine the boundary sprint. Rows for sprints before this are never touched.
     current_sprint_num = _determine_current_sprint_num(issues, ws)
+
+    # Build sprint_map: sprint_num → sprint_obj (for startDate/state checks in REMOVE).
+    sprint_map: dict = {}
+    for issue in issues:
+        for s in (issue["fields"].get("customfield_10020") or []):
+            num = _sprint_num(s.get("name", ""))
+            if num >= MIN_SPRINT and num not in sprint_map:
+                sprint_map[num] = s
 
     # Build api_map for current sprint and beyond only.
     # "Move out of Sprint" entries are excluded: the Remove operation handles those
@@ -711,19 +736,24 @@ def update_excel(input_path, issues):
 
     # ── REMOVE ───────────────────────────────────────────────────────────────
     # Rows in the spreadsheet that are no longer in the Jira API for that sprint:
-    # write "Move out of Sprint" into column D and leave every other cell untouched.
+    # - Sprint hasn't started yet → delete the row (pre-planning churn, keep scope clean)
+    # - Sprint has started → write "Move out of Sprint" into column D, leave other cells
     # Already-marked rows are skipped so they are never overwritten again.
+    rows_to_delete_unstarted = []
     removed_count = 0
     for composite, row_indices in existing.items():
         if composite not in api_map:
             row_idx = row_indices[0]
-            if ws.cell(row=row_idx, column=4).value != "Move out of Sprint":
+            sprint_num = composite[1]
+            if not _sprint_started(sprint_num, sprint_map):
+                rows_to_delete_unstarted.append(row_idx)
+            elif ws.cell(row=row_idx, column=4).value != "Move out of Sprint":
                 ws.cell(row=row_idx, column=4).value = "Move out of Sprint"
                 removed_count += 1
 
-    # Delete duplicate rows (beyond the first occurrence) for current+ composites.
+    # Delete: (a) rows removed from unstarted sprints, (b) duplicate rows beyond first.
     # Always process in reverse order so earlier row indices are not shifted.
-    to_delete = []
+    to_delete = list(rows_to_delete_unstarted)
     for row_indices in existing.values():
         to_delete.extend(row_indices[1:])
     to_delete.sort(reverse=True)
@@ -774,7 +804,8 @@ def update_excel(input_path, issues):
         f"Saved: {input_path} "
         f"(current sprint: {current_sprint_num} | "
         f"{len(api_map)} active sprint-rows across {len(issues)} tickets | "
-        f"{len(updated)} updated, {len(new_composites)} added, {removed_count} marked removed)"
+        f"{len(updated)} updated, {len(new_composites)} added, "
+        f"{removed_count} marked removed, {len(rows_to_delete_unstarted)} deleted (unstarted sprint))"
     )
     return current_sprint_num
 
@@ -821,7 +852,7 @@ def _sync_hplus(source_path: str, dest_path: str) -> None:
                 for col_idx, val in zip(SP_SYNC_COLS, vals):
                     ws_dst.cell(row=row_idx, column=col_idx).value = val
     wb_dst.save(dest_path)
-    print(f"H/J notes synced from SharePoint → X: drive ({len(hplus_map)} rows read)")
+    print(f"H/J notes synced from SharePoint -> X: drive ({len(hplus_map)} rows read)")
 
 
 def main():
