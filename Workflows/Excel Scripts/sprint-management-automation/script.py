@@ -7,7 +7,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Font, Alignment
 
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -74,33 +74,17 @@ for _ti, _team in enumerate(TEAMS):
 
 SHAREPOINT_SYNC_PATH = os.getenv("SHAREPOINT_SYNC_PATH", "").strip()
 
-# Font colors for the Type column (C); types not listed use default black
-TYPE_FONT_COLORS = {
-    "Bug":     "FF0000",
-    "Support": "00B050",
-    "Dialin ticket": "4472C4",
-    "Little-V": "7030A0",
-}
-
-# Light green used for every other data row (rows 5, 7, 9 … relative to DATA_START_ROW)
-ALT_ROW_COLOR = "E2EFDA"
-
 # Column headers written to row 3 — must match cell values exactly (leading spaces intentional).
 # Used by both _ensure_sheet_setup and _generate_table_xml so they stay in sync.
-SHEET_HEADERS = ["Sprint", "Assignee", " Type", "Scope Changes", "Description", "Jira #", " Status"]
+SHEET_HEADERS = ["Sprint", "Original Assignee", "Current Assignee", " Type", "Scope Changes", "Description", "Jira #", " Status"]
 
 TABLE_DISPLAY_NAME = "Table1"
-TABLE_STYLE        = "TableStyleMedium2"
+TABLE_STYLE        = "TableStyleMedium7"
 
 MIN_SPRINT = 28  # ignore every sprint before this number
 
-SP_SYNC_COLS = (8, 10)  # H and J only — synced read-only from SharePoint; I is script-controlled
+SP_SYNC_COLS = (9, 11)  # I and K only — synced read-only from SharePoint; J is script-controlled
 JIRA_NOTE_RE  = re.compile(r'xlsx<([^>]*)>xlsx')
-
-# Thin vertical separator for white rows — left edge of every column after the first.
-# Green rows use an empty border so the separator only appears on white rows.
-_WHITE_COL_BORDER = Border(left=Side(style="thin", color="E0E0E0"))
-_EMPTY_BORDER     = Border()
 
 VALIDATION_ROW_END    = 1000  # dropdowns cover data rows up to this row
 _SELECTION_SPRINT_MAX = 100   # Selection!F extended up to this sprint number
@@ -109,11 +93,12 @@ _SELECTION_SPRINT_MAX = 100   # Selection!F extended up to this sprint number
 # Sprint 28 lives at Selection!F29 (row = sprint + 1; row 1 is header).
 _COL_VALIDATIONS = {
     "A": f"Selection!$F$29:$F${_SELECTION_SPRINT_MAX + 1}",  # Sprint (28+)
-    "B": "Selection!$A$2:$A$26",  # Assignee
-    "C": "Selection!$D$2:$D$6",   # Type (Process Type)
-    "D": "Selection!$H$2:$H$4",   # Scope Changes
-    "E": "Selection!$K$2:$K$3",   # Description (Y/N)
-    "G": "Selection!$E$2:$E$7",   # Status (Ticket Status)
+    "B": "Selection!$A$2:$A$26",  # Original Assignee (was A)
+    "C": "Selection!$A$2:$A$26",  # Current Assignee (was B)
+    "D": "Selection!$D$2:$D$6",   # Type (was C)
+    "E": "Selection!$H$2:$H$4",   # Scope Changes (was D)
+    "F": "Selection!$K$2:$K$3",   # Description (was E)
+    "H": "Selection!$E$2:$E$7",   # Status (was G)
 }
 
 
@@ -392,33 +377,15 @@ def _extract_key(label):
 # ── Excel helpers ─────────────────────────────────────────────────────────────
 
 def _ensure_sheet_setup(ws):
-    # Row 1: note banner — Calibri 14
-    for col in range(1, ws.max_column + 1):
-        cell = ws.cell(row=1, column=col)
-        if cell.value is not None:
-            cell.font = Font(name="Calibri", size=14, bold=bool(cell.font.bold))
-
-    # Row 2: sprint info — Calibri 11
-    for col in range(1, ws.max_column + 1):
-        cell = ws.cell(row=2, column=col)
-        if cell.value is not None:
-            cell.font = Font(name="Calibri", size=11, bold=bool(cell.font.bold))
-
-    header_fill = PatternFill(fill_type="solid", fgColor="FFC000")  
-    header_font = Font(name="Calibri", size=11, bold=True)
-
     for col, header in enumerate(SHEET_HEADERS, start=1):
         cell = ws.cell(row=3, column=col)
         cell.value     = header
-        cell.fill      = header_fill
-        cell.font      = header_font
         cell.alignment = Alignment(horizontal="left", vertical="center")
 
     ws.row_dimensions[3].height = 18.75
     ws.freeze_panes = "A4"
 
-    # Match actual file column widths; E (Description) left at default (narrow/unused)
-    widths = {"A": 9.29, "B": 10.57, "C": 11.57, "D": 18.43, "F": 103.14, "G": 16.29}
+    widths = {"A": 9.29, "B": 10.57, "C": 10.57, "D": 11.57, "E": 18.43, "G": 103.14, "H": 16.29}
     for col_letter, width in widths.items():
         ws.column_dimensions[col_letter].width = width
 
@@ -451,16 +418,63 @@ def _ensure_data_validations(ws):
         ws.add_data_validation(dv)
 
 
-def _row_bg(row_idx):
-    """Return the alternating background color for a given absolute row index."""
-    return ALT_ROW_COLOR if (row_idx - DATA_START_ROW) % 2 == 1 else "FFFFFF"
+def _original_assignee_for_sprint(issue, sprint_name) -> str:
+    """
+    Return the nickname of whoever was assigned when the ticket was first added to sprint_name.
+    Replays the Jira assignee changelog up to the moment of sprint entry.
+    Falls back to current assignee if sprint_name is None or no sprint entry event is found.
+    """
+    fields    = issue["fields"]
+    histories = issue["changelog"]["histories"]
+    current_full = fields["assignee"]["displayName"] if fields.get("assignee") else ""
+
+    if not sprint_name:
+        return _assignee_nickname(current_full)
+
+    # Find the earliest timestamp when this ticket was added to sprint_name
+    sprint_added_dt = None
+    for history in histories:
+        for item in history["items"]:
+            if item["field"] != "Sprint":
+                continue
+            to_sprints   = _sprint_names(item.get("toString")  or "")
+            from_sprints = _sprint_names(item.get("fromString") or "")
+            if sprint_name in to_sprints and sprint_name not in from_sprints:
+                dt = parse_date(history["created"])
+                if sprint_added_dt is None or dt < sprint_added_dt:
+                    sprint_added_dt = dt
+
+    if sprint_added_dt is None:
+        return _assignee_nickname(current_full)
+
+    # Collect all assignee changes sorted oldest first
+    assignee_changes = []
+    for history in histories:
+        for item in history["items"]:
+            if item["field"] == "assignee":
+                assignee_changes.append((parse_date(history["created"]), item))
+    assignee_changes.sort(key=lambda x: x[0])
+
+    if not assignee_changes:
+        return _assignee_nickname(current_full)
+
+    # The state before the first ever change is fromString of the earliest change.
+    # Apply each change forward up to and including sprint_added_dt.
+    current_state = assignee_changes[0][1].get("fromString") or ""
+    for change_dt, item in assignee_changes:
+        if change_dt <= sprint_added_dt:
+            current_state = item.get("toString") or ""
+        else:
+            break
+
+    return _assignee_nickname(current_state) if current_state else "Unassigned"
 
 
 def _write_issue_row(ws, row_idx, row_record):
     """
-    Write one (issue, sprint) entry into columns A–G of the given row.
-    A=Sprint(int), B=Assignee, C=Type, D=Scope, E=empty, F=Jira#(hyperlink), G=Status
-    row_record = {"issue": issue_obj, "sprint_num": int, "scope": str}
+    Write one (issue, sprint) entry into columns A–H of the given row.
+    A=Sprint, B=OriginalAssignee, C=CurrentAssignee, D=Type, E=Scope, F=empty, G=Jira#, H=Status
+    row_record = {"issue": issue_obj, "sprint_num": int, "scope": str, "original_assignee": str}
     """
     issue      = row_record["issue"]
     sprint_num = row_record["sprint_num"]
@@ -469,8 +483,9 @@ def _write_issue_row(ws, row_idx, row_record):
     fields = issue["fields"]
     key    = issue["key"]
 
-    full_name    = fields["assignee"]["displayName"] if fields.get("assignee") else ""
-    assignee     = _assignee_nickname(full_name)
+    full_name         = fields["assignee"]["displayName"] if fields.get("assignee") else ""
+    current_assignee  = _assignee_nickname(full_name)
+    original_assignee = row_record.get("original_assignee") or current_assignee
     issue_type   = get_type(issue)
     ticket_url   = f"{BASE_URL}/browse/{key}"
     ticket_label = f"[{key}] {fields.get('summary', '')}"
@@ -478,64 +493,25 @@ def _write_issue_row(ws, row_idx, row_record):
     has_description = "Y" if len(desc_text) > 20 else "N"
     status          = get_status(issue)
 
-    # Column order: A        B         C           D           E              F         G
-    values = [sprint_num, assignee, issue_type, scope, has_description, ticket_label, status]
+    # Column order: A          B                  C                D           E      F              G             H
+    values = [sprint_num, original_assignee, current_assignee, issue_type, scope, has_description, ticket_label, status]
 
-    bg         = _row_bg(row_idx)
-    base_align = Alignment(horizontal="left", vertical="center")
+    align = Alignment(horizontal="left", vertical="center")
 
     for col, value in enumerate(values, start=1):
         cell           = ws.cell(row=row_idx, column=col, value=value)
-        cell.alignment = base_align
-
-        if col == 6:  # F — Jira # (hyperlinked ticket title, blue underline)
-            cell.fill      = PatternFill(fill_type="solid", fgColor=bg)
+        cell.alignment = align
+        if col == 7:  # G — Jira # hyperlink
             cell.font      = Font(name="Calibri", size=11, color="1155CC", underline="single")
             cell.hyperlink = ticket_url
-
-        elif col == 7:  # G — Status (bold Calibri 11, alternating background — no status color)
-            cell.fill      = PatternFill(fill_type="solid", fgColor=bg)
-            cell.font      = Font(name="Calibri", size=11, bold=True)
+        else:
             cell.hyperlink = None
 
-        elif col == 3:  # C — Type (colored font for Bug/Support; default otherwise)
-            cell.fill      = PatternFill(fill_type="solid", fgColor=bg)
-            type_color     = TYPE_FONT_COLORS.get(issue_type)
-            cell.font      = Font(name="Calibri", size=11, color=type_color) if type_color \
-                             else Font(name="Calibri", size=11)
-            cell.hyperlink = None
-
-        else:  # A, B, D, E — plain text with alternating background
-            cell.fill      = PatternFill(fill_type="solid", fgColor=bg)
-            cell.font      = Font(name="Calibri", size=11)
-            cell.hyperlink = None
-
-    # Column I (9) — latest xlsx<...>xlsx Jira comment; skipped when None (leaves existing value)
+    # Column J (10) — latest xlsx<...>xlsx Jira comment; skipped when None (leaves existing value)
     jira_note = row_record.get("jira_note")
     if jira_note is not None:
-        cell_i           = ws.cell(row=row_idx, column=9, value=jira_note)
-        cell_i.alignment = base_align
-        cell_i.fill      = PatternFill(fill_type="solid", fgColor=bg)
-        cell_i.font      = Font(name="Calibri", size=11)
-        cell_i.hyperlink = None
-
-
-def _apply_alternating_fills(ws, start_row=DATA_START_ROW):
-    """
-    Re-apply position-based alternating fills to columns A–J (1–10).
-    K+ are unused and left blank. Only fill is changed; H–J values/fonts untouched.
-    Pass start_row to limit re-application to current sprint onward, leaving past rows intact.
-    """
-    for row_idx in range(start_row, ws.max_row + 1):
-        if not any(ws.cell(row=row_idx, column=c).value is not None for c in range(1, 11)):
-            continue  # skip rows with no content in A–J
-
-        bg = _row_bg(row_idx)
-
-        for col in range(1, 11):  # A through J (col 10); K+ are unused and left blank
-            cell        = ws.cell(row=row_idx, column=col)
-            cell.fill   = PatternFill(fill_type="solid", fgColor=bg)
-            cell.border = _WHITE_COL_BORDER if (bg == "FFFFFF" and col > 1) else _EMPTY_BORDER
+        cell_j           = ws.cell(row=row_idx, column=10, value=jira_note)
+        cell_j.alignment = align
 
 
 def _ensure_table_in_model(ws, new_ref: str) -> None:
@@ -576,7 +552,7 @@ def _patch_xlsx_table(xlsx_path: str, final_row: int, col_names: list) -> None:
     identifiers, then overwrites only that entry in the zip.
     col_names must match the actual row-3 header values for every table column.
     """
-    ref = f"A3:J{final_row}"
+    ref = f"A3:K{final_row}"
 
     with zipfile.ZipFile(xlsx_path, "r") as zin:
         table_paths = [n for n in zin.namelist()
@@ -591,14 +567,13 @@ def _patch_xlsx_table(xlsx_path: str, final_row: int, col_names: list) -> None:
     m_id      = re.search(r'\bid="(\d+)"',                   raw_xml)
     m_name    = re.search(r'<table\b[^>]+\bname="([^"]+)"',  raw_xml)
     m_display = re.search(r'\bdisplayName="([^"]+)"',         raw_xml)
-    m_style   = re.search(r'<tableStyleInfo[^>]+\bname="([^"]+)"', raw_xml)
 
     clean_xml = _generate_table_xml(
         ref,
         tbl_id      = int(m_id.group(1))    if m_id      else 1,
         name        = m_name.group(1)        if m_name    else TABLE_DISPLAY_NAME,
         display_name= m_display.group(1)     if m_display else TABLE_DISPLAY_NAME,
-        style       = m_style.group(1)       if m_style   else TABLE_STYLE,
+        style       = TABLE_STYLE,
         col_names   = col_names,
     )
 
@@ -628,18 +603,6 @@ def _insert_point_for_sprint(ws, sprint_num):
         if n <= sprint_num:
             result = row_idx
     return result
-
-
-def _first_current_row_idx(ws, current_sprint_num):
-    """Return the first row index with sprint >= current_sprint_num, or ws.max_row + 1."""
-    for row_idx in range(DATA_START_ROW, ws.max_row + 1):
-        try:
-            n = int(ws.cell(row=row_idx, column=1).value)
-        except (TypeError, ValueError):
-            continue
-        if n >= current_sprint_num:
-            return row_idx
-    return ws.max_row + 1
 
 
 def _sprint_started(sprint_num: int, sprint_map: dict) -> bool:
@@ -700,18 +663,24 @@ def update_excel(input_path, issues):
             if sprint_num < current_sprint_num or scope == "Move out of Sprint":
                 continue
             composite = (issue["key"], sprint_num)
+            sprint_name = next(
+                (s["name"] for s in (issue["fields"].get("customfield_10020") or [])
+                 if _sprint_num(s.get("name", "")) == sprint_num),
+                None
+            )
             api_map[composite] = {
-                "issue":      issue,
-                "sprint_num": sprint_num,
-                "scope":      scope,
-                "jira_note":  issue.get("_jira_note"),
+                "issue":             issue,
+                "sprint_num":        sprint_num,
+                "scope":             scope,
+                "jira_note":         issue.get("_jira_note"),
+                "original_assignee": _original_assignee_for_sprint(issue, sprint_name),
             }
 
     # Build existing map for current sprint and beyond only.
     # Past sprint rows (sprint < current_sprint_num) are completely skipped.
     existing = {}  # composite → [row_idx, ...]
     for row_idx in range(DATA_START_ROW, ws.max_row + 1):
-        label      = ws.cell(row=row_idx, column=6).value
+        label      = ws.cell(row=row_idx, column=7).value
         sprint_val = ws.cell(row=row_idx, column=1).value
         key        = _extract_key(label)
         try:
@@ -728,7 +697,7 @@ def update_excel(input_path, issues):
     for composite, row_indices in existing.items():
         if composite in api_map:
             row_idx = row_indices[0]
-            if ws.cell(row=row_idx, column=4).value == "Move out of Sprint":
+            if ws.cell(row=row_idx, column=5).value == "Move out of Sprint":
                 updated.add(composite)
                 continue
             _write_issue_row(ws, row_idx, api_map[composite])
@@ -747,8 +716,8 @@ def update_excel(input_path, issues):
             sprint_num = composite[1]
             if not _sprint_started(sprint_num, sprint_map):
                 rows_to_delete_unstarted.append(row_idx)
-            elif ws.cell(row=row_idx, column=4).value != "Move out of Sprint":
-                ws.cell(row=row_idx, column=4).value = "Move out of Sprint"
+            elif ws.cell(row=row_idx, column=5).value != "Move out of Sprint":
+                ws.cell(row=row_idx, column=5).value = "Move out of Sprint"
                 removed_count += 1
 
     # Delete: (a) rows removed from unstarted sprints, (b) duplicate rows beyond first.
@@ -776,24 +745,18 @@ def update_excel(input_path, issues):
         for j, composite in enumerate(new_by_sprint[sprint_num]):
             _write_issue_row(ws, insert_after + 1 + j, api_map[composite])
 
-    # Re-apply position-based alternating fills from the first current-sprint row
-    # onward. Past sprint rows are completely untouched.
-    first_current = _first_current_row_idx(ws, current_sprint_num)
-    if first_current <= ws.max_row:
-        _apply_alternating_fills(ws, start_row=first_current)
-
-    # Remove trailing rows that carry fills/borders but no ticket data.
+    # Remove trailing rows with no ticket data.
     for row_idx in range(ws.max_row, DATA_START_ROW - 1, -1):
-        if any(ws.cell(row=row_idx, column=c).value is not None for c in range(1, 8)):
+        if any(ws.cell(row=row_idx, column=c).value is not None for c in range(1, 9)):
             break
         ws.delete_rows(row_idx)
 
     if ws.max_row >= DATA_START_ROW:
-        _ensure_table_in_model(ws, f"A3:J{ws.max_row}")
+        _ensure_table_in_model(ws, f"A3:K{ws.max_row}")
 
     table_col_names = [
         ws.cell(row=3, column=c).value or f"Column{c}"
-        for c in range(1, 11)
+        for c in range(1, 12)
     ]
 
     final_row = ws.max_row
@@ -828,7 +791,7 @@ def _sync_hplus(source_path: str, dest_path: str) -> None:
     ws_src = wb_src[SHEET_NAME]
     hplus_map = {}
     for row_idx in range(DATA_START_ROW, ws_src.max_row + 1):
-        key = _extract_key(ws_src.cell(row=row_idx, column=6).value)
+        key = _extract_key(ws_src.cell(row=row_idx, column=7).value)
         try:
             sprint_num = int(ws_src.cell(row=row_idx, column=1).value)
         except (TypeError, ValueError):
@@ -841,7 +804,7 @@ def _sync_hplus(source_path: str, dest_path: str) -> None:
     wb_dst = load_workbook(dest_path)
     ws_dst = wb_dst[SHEET_NAME]
     for row_idx in range(DATA_START_ROW, ws_dst.max_row + 1):
-        key = _extract_key(ws_dst.cell(row=row_idx, column=6).value)
+        key = _extract_key(ws_dst.cell(row=row_idx, column=7).value)
         try:
             sprint_num = int(ws_dst.cell(row=row_idx, column=1).value)
         except (TypeError, ValueError):
