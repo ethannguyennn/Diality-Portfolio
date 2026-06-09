@@ -3,6 +3,7 @@ import io
 import os
 import re
 import uuid
+import shutil
 import zipfile
 import requests
 from requests.auth import HTTPBasicAuth
@@ -61,7 +62,7 @@ NICKNAME_MAP = {
     "Caitlynn Chang":         "Caitlynn",
     "Santhos Kumar Reddy":    "Santhos",
     "Abhijit Barman":         "Abhijit",
-    "Chris Yu":              "Chris",
+    "Chris Yu":               "Chris",
     "Vitas Buenaventura":     "Vitas",
 }
 
@@ -75,6 +76,7 @@ for _ti, _team in enumerate(TEAMS):
             _ASSIGNEE_TO_TEAM_IDX[_nick] = _ti
 
 SHAREPOINT_SYNC_PATH = os.getenv("SHAREPOINT_SYNC_PATH", "").strip()
+ARCHIVE_PATH         = os.getenv("ARCHIVE_PATH", "").strip()
 
 # Column headers written to row 3 — must match cell values exactly (leading spaces intentional).
 # Used by both _ensure_sheet_setup and _generate_table_xml so they stay in sync.
@@ -429,20 +431,23 @@ def _ensure_data_validations(ws):
         ws.add_data_validation(dv)
 
 
-def _original_assignee_for_sprint(issue, sprint_name) -> str:
+def _original_assignee_for_sprint(issue, sprint_obj) -> str:
     """
-    Return the nickname of whoever was assigned when the ticket was first added to sprint_name.
-    Replays the Jira assignee changelog up to the moment of sprint entry.
-    Falls back to current assignee if sprint_name is None or no sprint entry event is found.
+    Return the nickname of the assignee at the effective cutoff for this sprint:
+      - Scoped tickets (added <= EOD of sprint start): assignee at EOD of the sprint start day.
+      - Added tickets (added > EOD of sprint start): assignee at the moment of sprint entry.
+    Falls back to current assignee if sprint_obj is None or no sprint entry event is found.
     """
     fields    = issue["fields"]
     histories = issue["changelog"]["histories"]
     current_full = fields["assignee"]["displayName"] if fields.get("assignee") else ""
 
-    if not sprint_name:
+    if not sprint_obj:
         return _assignee_nickname(current_full)
 
-    # Find the earliest timestamp when this ticket was added to sprint_name
+    sprint_name = sprint_obj.get("name", "")
+
+    # Find the earliest timestamp when this ticket was added to the sprint
     sprint_added_dt = None
     for history in histories:
         for item in history["items"]:
@@ -458,6 +463,16 @@ def _original_assignee_for_sprint(issue, sprint_name) -> str:
     if sprint_added_dt is None:
         return _assignee_nickname(current_full)
 
+    # Scoped tickets use EOD of sprint start; Added tickets use the sprint entry moment.
+    # max() picks the later of the two, which is sprint_start_eod for Scoped and
+    # sprint_added_dt for Added — matching _classify_sprint_timing's EOD definition.
+    sprint_start_dt = parse_date(sprint_obj.get("startDate"))
+    if sprint_start_dt:
+        sprint_start_eod = sprint_start_dt.replace(hour=23, minute=59, second=59, microsecond=0)
+        cutoff_dt = max(sprint_added_dt, sprint_start_eod)
+    else:
+        cutoff_dt = sprint_added_dt
+
     # Collect all assignee changes sorted oldest first
     assignee_changes = []
     for history in histories:
@@ -470,10 +485,10 @@ def _original_assignee_for_sprint(issue, sprint_name) -> str:
         return _assignee_nickname(current_full)
 
     # The state before the first ever change is fromString of the earliest change.
-    # Apply each change forward up to and including sprint_added_dt.
+    # Apply each change forward up to and including the cutoff.
     current_state = assignee_changes[0][1].get("fromString") or ""
     for change_dt, item in assignee_changes:
-        if change_dt <= sprint_added_dt:
+        if change_dt <= cutoff_dt:
             current_state = item.get("toString") or ""
         else:
             break
@@ -714,8 +729,8 @@ def update_excel(input_path, issues):
             if sprint_num < current_sprint_num or scope == "Move out of Sprint":
                 continue
             composite = (issue["key"], sprint_num)
-            sprint_name = next(
-                (s["name"] for s in (issue["fields"].get("customfield_10020") or [])
+            sprint_obj = next(
+                (s for s in (issue["fields"].get("customfield_10020") or [])
                  if _sprint_num(s.get("name", "")) == sprint_num),
                 None
             )
@@ -724,7 +739,7 @@ def update_excel(input_path, issues):
                 "sprint_num":        sprint_num,
                 "scope":             scope,
                 "jira_note":         issue.get("_jira_note"),
-                "original_assignee": _original_assignee_for_sprint(issue, sprint_name),
+                "original_assignee": _original_assignee_for_sprint(issue, sprint_obj),
             }
 
     # Build existing map for current sprint and beyond only.
@@ -881,6 +896,24 @@ def _sync_hplus(source_path: str, dest_path: str) -> None:
     print(f"H/J notes synced from SharePoint -> X: drive ({len(hplus_map)} rows read)")
 
 
+def _archive_excel(source_path: str, archive_dir: str) -> None:
+    """
+    Copy source_path into archive_dir with today's date (MMDDYYYY) appended to the stem.
+    Raises RuntimeError if the directory doesn't exist or the copy fails, so the script
+    aborts before any changes are made to the source file.
+    """
+    if not os.path.isdir(archive_dir):
+        raise RuntimeError(
+            f"ARCHIVE_PATH does not exist or is not a directory: '{archive_dir}'. "
+            "Create the directory or update ARCHIVE_PATH in .env."
+        )
+    stem, ext = os.path.splitext(os.path.basename(source_path))
+    date_suffix = datetime.now().strftime("%m%d%Y")
+    archive_dest = os.path.join(archive_dir, f"{stem}_{date_suffix}{ext}")
+    shutil.copy2(source_path, archive_dest)
+    print(f"Archived: {archive_dest}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Update Leahi Sprint Management Excel from Jira."
@@ -904,9 +937,17 @@ def main():
             "SharePoint file is currently open or locked — close it in Excel and re-run."
         )
 
+    if not ARCHIVE_PATH:
+        raise RuntimeError(
+            "ARCHIVE_PATH is not set in .env. "
+            "Set it to the directory where archive copies should be saved."
+        )
+
     print("Fetching issues from Jira...")
     issues = get_jira_issues()
     print(f"Found {len(issues)} issues")
+    print("Archiving Excel file...")
+    _archive_excel(args.input, ARCHIVE_PATH)
     print("Updating Sprint Template on X: drive...")
     update_excel(args.input, issues)
     print("Syncing H-J notes from SharePoint to X: drive...")
