@@ -804,8 +804,6 @@ def update_excel(input_path, issues):
 
     final_row = ws.max_row
 
-    ws.protection.sheet = False
-
     if final_row >= DATA_START_ROW:
         _ensure_table_in_model(ws, f"A3:K{final_row}")
 
@@ -878,7 +876,6 @@ def _sync_hplus(source_path: str, dest_path: str) -> None:
         str(v) if (v := ws_dst.cell(row=3, column=c).value) and str(v).strip() else f"Column{c}"
         for c in range(1, 12)
     ]
-    ws_dst.protection.sheet = False
     wb_dst.save(dest_path)
     _patch_xlsx_table(dest_path, final_row, dest_table_xml, col_names)
     print(f"H/J notes synced from SharePoint -> X: drive ({len(hplus_map)} rows read)")
