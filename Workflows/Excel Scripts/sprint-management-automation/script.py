@@ -102,7 +102,7 @@ _SELECTION_SPRINT_MAX = 100   # Selection!F extended up to this sprint number
 # Sprint Template column → Selection sheet source range for dropdown validation.
 # Sprint 28 lives at Selection!F29 (row = sprint + 1; row 1 is header).
 _COL_VALIDATIONS = {
-    "A": f"Selection!$F$29:$F${_SELECTION_SPRINT_MAX + 1}",  
+    "A": "Selection!$F$2:$F$33",  
     "B": "Selection!$A$2:$A$26",  
     "C": "Selection!$A$2:$A$26",  
     "D": "Selection!$D$2:$D$6",   
