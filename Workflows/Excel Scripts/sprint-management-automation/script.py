@@ -93,6 +93,7 @@ TYPE_FONT_COLORS = {
     "Big-V":        "000000",
 }
 
+
 MIN_SPRINT = 28  # ignore every sprint before this number
 
 SP_SYNC_COLS = (9, 11)  # I and K only — synced read-only from SharePoint; J is script-controlled
@@ -110,7 +111,6 @@ _COL_VALIDATIONS = {
     "D": "Selection!$D$2:$D$6",   
     "E": "Selection!$H$2:$H$4",   
     "F": "Selection!$K$2:$K$3",   
-    "H": "Selection!$E$2:$E$7",
     "I": "Selection!$J$2:$J$5",
 }
 
@@ -364,21 +364,22 @@ def get_sprint_history(issue, current_sprint_num):
     return sorted(sprint_entries.items(), key=lambda x: x[0])  # [(sprint_num, scope), ...]
 
 
-def get_status(issue):
+def get_status(issue) -> str:
     status       = issue["fields"]["status"]
     status_name  = status["name"].lower()
     category_key = status["statusCategory"]["key"]
 
     if "blocked" in status_name:
         return "Blocked"
-    elif "on hold" in status_name or "on-hold" in status_name:
-        return "On-hold"
-    elif "in progress" in status_name:
-        return "In-progress"
-    elif category_key == "done" or "done" in status_name or "complete" in status_name:
+    if "on hold" in status_name or "on-hold" in status_name:
+        return "On Hold"
+    if status_name == "n/a":
+        return "N/A"
+    if category_key == "done" or "done" in status_name or "complete" in status_name:
         return "Done"
-    else:
+    if category_key == "new":
         return "Not started"
+    return "In-progress"
 
 
 def _extract_key(label):
@@ -428,6 +429,55 @@ def _ensure_data_validations(ws):
             errorStyle="warning",
         )
         dv.add(f"{col_letter}{DATA_START_ROW}:{col_letter}{VALIDATION_ROW_END}")
+        ws.add_data_validation(dv)
+
+
+def _ensure_h_validation(ws) -> None:
+    """
+    Apply data validation to column H (Status) based on the written values in column D (Type).
+    Groups consecutive same-type rows into a single DataValidation range.
+    Bug / Dialin ticket rows  →  Selection!$L$2:$L$14
+    All other rows            →  Selection!$E$2:$E$7  (default, also covers future empty rows)
+    Must be called AFTER all data rows have been written so column D reflects current types.
+    """
+    _BUG_DIALIN = {"Bug", "Dialin ticket"}
+    _L_RANGE    = "Selection!$L$2:$L$13"
+    _E_RANGE    = "Selection!$E$2:$E$7"
+
+    # Classify each written data row: True = Bug/Dialin, False = everything else
+    row_types = []
+    for row_idx in range(DATA_START_ROW, ws.max_row + 1):
+        d_val = ws.cell(row=row_idx, column=4).value
+        row_types.append((row_idx, d_val in _BUG_DIALIN))
+
+    # Build (start_row, end_row, is_bug_dialin) groups of consecutive same-type rows
+    groups = []
+    if row_types:
+        cur_start, cur_type = row_types[0]
+        for row_idx, is_bug in row_types[1:]:
+            if is_bug != cur_type:
+                groups.append((cur_start, row_idx - 1, cur_type))
+                cur_start, cur_type = row_idx, is_bug
+        groups.append((cur_start, row_types[-1][0], cur_type))
+        # All rows beyond the last written row get the default E range
+        last_data_row = row_types[-1][0]
+        if last_data_row < VALIDATION_ROW_END:
+            groups.append((last_data_row + 1, VALIDATION_ROW_END, False))
+    else:
+        # No data rows at all — apply default to the entire expected range
+        groups.append((DATA_START_ROW, VALIDATION_ROW_END, False))
+
+    for start_row, end_row, is_bug_dialin in groups:
+        dv = DataValidation(
+            type="list",
+            formula1=_L_RANGE if is_bug_dialin else _E_RANGE,
+            allow_blank=True,
+            showErrorMessage=True,
+            errorTitle="Invalid entry",
+            error="Please select from the dropdown list.",
+            errorStyle="warning",
+        )
+        dv.add(f"H{start_row}:H{end_row}")
         ws.add_data_validation(dv)
 
 
@@ -517,7 +567,7 @@ def _write_issue_row(ws, row_idx, row_record):
     ticket_label = f"[{key}] {fields.get('summary', '')}"
     desc_text       = _adf_to_text(fields.get("description") or "")
     has_description = "Y" if len(desc_text) > 20 else "N"
-    status          = get_status(issue)
+    status = get_status(issue)
 
     # Column order: A          B                  C                D           E      F              G             H
     values = [sprint_num, original_assignee, current_assignee, issue_type, scope, has_description, ticket_label, status]
@@ -827,6 +877,7 @@ def update_excel(input_path, issues):
         for c in range(1, 12)
     ]
 
+    _ensure_h_validation(ws)
     wb.save(input_path)
 
     _patch_xlsx_table(input_path, final_row, orig_table_xml, col_names)
