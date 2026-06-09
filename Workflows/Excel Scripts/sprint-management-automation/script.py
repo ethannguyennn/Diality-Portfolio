@@ -8,7 +8,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 from openpyxl import load_workbook
-from openpyxl.styles import Font, Alignment
+from openpyxl.styles import Font, Alignment, Protection
 
 from openpyxl.worksheet.table import Table, TableStyleInfo, TableColumn
 from openpyxl.utils import range_boundaries
@@ -83,6 +83,14 @@ SHEET_HEADERS = ["Sprint", "Original Assignee", "Current Assignee", " Type", "Sc
 TABLE_DISPLAY_NAME = "Table1"
 TABLE_STYLE        = "TableStyleMedium7"
 
+TYPE_FONT_COLORS = {
+    "Bug":          "FF0000",
+    "Dialin ticket": "4472C4",
+    "Support":      "00B050",
+    "Little-V":     "7030A0",
+    "Big-V":        "000000",
+}
+
 MIN_SPRINT = 28  # ignore every sprint before this number
 
 SP_SYNC_COLS = (9, 11)  # I and K only — synced read-only from SharePoint; J is script-controlled
@@ -94,13 +102,14 @@ _SELECTION_SPRINT_MAX = 100   # Selection!F extended up to this sprint number
 # Sprint Template column → Selection sheet source range for dropdown validation.
 # Sprint 28 lives at Selection!F29 (row = sprint + 1; row 1 is header).
 _COL_VALIDATIONS = {
-    "A": f"Selection!$F$29:$F${_SELECTION_SPRINT_MAX + 1}",  # Sprint (28+)
-    "B": "Selection!$A$2:$A$26",  # Original Assignee (was A)
-    "C": "Selection!$A$2:$A$26",  # Current Assignee (was B)
-    "D": "Selection!$D$2:$D$6",   # Type (was C)
-    "E": "Selection!$H$2:$H$4",   # Scope Changes (was D)
-    "F": "Selection!$K$2:$K$3",   # Description (was E)
-    "H": "Selection!$E$2:$E$7",   # Status (was G)
+    "A": f"Selection!$F$29:$F${_SELECTION_SPRINT_MAX + 1}",  
+    "B": "Selection!$A$2:$A$26",  
+    "C": "Selection!$A$2:$A$26",  
+    "D": "Selection!$D$2:$D$6",   
+    "E": "Selection!$H$2:$H$4",   
+    "F": "Selection!$K$2:$K$3",   
+    "H": "Selection!$E$2:$E$7",
+    "I": "Selection!$J$2:$J$5",
 }
 
 
@@ -501,19 +510,24 @@ def _write_issue_row(ws, row_idx, row_record):
     align = Alignment(horizontal="left", vertical="center")
 
     for col, value in enumerate(values, start=1):
-        cell           = ws.cell(row=row_idx, column=col, value=value)
-        cell.alignment = align
+        cell            = ws.cell(row=row_idx, column=col, value=value)
+        cell.alignment  = align
+        cell.protection = Protection(locked=False)
         if col == 7:  # G — Jira # hyperlink
             cell.font      = Font(name="Calibri", size=11, color="1155CC", underline="single")
             cell.hyperlink = ticket_url
+        elif col == 4:  # D — Type
+            cell.font      = Font(name="Calibri", size=11, color=TYPE_FONT_COLORS.get(issue_type, "000000"))
+            cell.hyperlink = None
         else:
             cell.hyperlink = None
 
     # Column J (10) — latest xlsx<...>xlsx Jira comment; skipped when None (leaves existing value)
     jira_note = row_record.get("jira_note")
     if jira_note is not None:
-        cell_j           = ws.cell(row=row_idx, column=10, value=jira_note)
-        cell_j.alignment = align
+        cell_j            = ws.cell(row=row_idx, column=10, value=jira_note)
+        cell_j.alignment  = align
+        cell_j.protection = Protection(locked=False)
 
 
 def _ensure_table_in_model(ws, new_ref: str) -> None:
@@ -790,6 +804,8 @@ def update_excel(input_path, issues):
 
     final_row = ws.max_row
 
+    ws.protection.sheet = False
+
     if final_row >= DATA_START_ROW:
         _ensure_table_in_model(ws, f"A3:K{final_row}")
 
@@ -854,13 +870,15 @@ def _sync_hplus(source_path: str, dest_path: str) -> None:
             vals = hplus_map.get((key, sprint_num))
             if vals is not None:
                 for col_idx, val in zip(SP_SYNC_COLS, vals):
-                    ws_dst.cell(row=row_idx, column=col_idx).value = val
+                    c            = ws_dst.cell(row=row_idx, column=col_idx, value=val)
+                    c.protection = Protection(locked=False)
 
     final_row = ws_dst.max_row
     col_names = [
         str(v) if (v := ws_dst.cell(row=3, column=c).value) and str(v).strip() else f"Column{c}"
         for c in range(1, 12)
     ]
+    ws_dst.protection.sheet = False
     wb_dst.save(dest_path)
     _patch_xlsx_table(dest_path, final_row, dest_table_xml, col_names)
     print(f"H/J notes synced from SharePoint -> X: drive ({len(hplus_map)} rows read)")
