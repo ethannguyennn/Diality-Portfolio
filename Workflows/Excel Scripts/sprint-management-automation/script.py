@@ -1,4 +1,5 @@
 import argparse
+import copy
 import io
 import os
 import re
@@ -26,11 +27,16 @@ DATA_START_ROW = 4  # Row 1=note banner, Row 2=sprint info, Row 3=headers, Row 4
 SWVV_TEAM = ["Raghu Kallala", "Thomas Lippold", "Tejaskumar Patel", "Tiffany Mejia",
              "Zoltan Miskolci", "Sarina Cheung", "Tisha Patel", "Ethan Nguyen"]
 FW_TEAM   = ["Arpita Srivastava", "Jashwant Gantyada", "Michael Garthwaite", "Praneeth Bunne",
-             "Sameer Poyil", "Varshini Nagabooshanam", "Vijay Pamula", "Suresh Dharnala", "Santhos Kumar Reddy", 
+             "Sameer Poyil", "Varshini Nagabooshanam", "Vijay Pamula", "Suresh Dharnala", "Santhos Kumar Reddy",
              "Vinayakam Mani", "Sean Nash"]
 SW_TEAM   = ["Nicholas Ramirez", "Stephen Quong", "Dara Navaei", "Behrouz NematiPour"]
-SYS_TEAM  = ["Eliza Petersen", "Caitlynn Chang", "Christina Heine", "Abhijit Barman", "Chris Yu", "Vitas Buenaventura"]
+SYS_TEAM  = ["Eliza Petersen", "Caitlynn Chang", "Christina Heine", "Abhijit Barman", "Chris Yu", "Vitas Buenaventura", "Emiline Hernandez"]
 TEAMS = [FW_TEAM, SWVV_TEAM, SW_TEAM, SYS_TEAM]
+
+# Display label for the "Team" column, aligned 1:1 with TEAMS indices.
+TEAM_NAMES = ["FW", "SWVV", "SW", "SYS"]
+_SYS_TEAM_IDX       = len(TEAMS) - 1  # SYS_TEAM's index in TEAMS — original assignees here are excluded entirely
+_UNMATCHED_TEAM_IDX = len(TEAMS)      # sort bucket for assignees not in any TEAMS list
 
 # Full Jira display name → nickname used in the Selection sheet dropdowns.
 # Non-obvious entries are listed first; straightforward first-name entries follow.
@@ -64,6 +70,7 @@ NICKNAME_MAP = {
     "Abhijit Barman":         "Abhijit",
     "Chris Yu":               "Chris",
     "Vitas Buenaventura":     "Vitas",
+    "Emiline Hernandez":      "Emiline",
 }
 
 # Lookup from assignee name (full Jira OR nickname) → team sort index.
@@ -80,7 +87,7 @@ ARCHIVE_PATH         = os.getenv("ARCHIVE_PATH", "").strip()
 
 # Column headers written to row 3 — must match cell values exactly (leading spaces intentional).
 # Used by both _ensure_sheet_setup and _generate_table_xml so they stay in sync.
-SHEET_HEADERS = ["Sprint", "Original Assignee", "Current Assignee", " Type", "Scope Changes", "Description", "Jira #", " Status"]
+SHEET_HEADERS = ["Sprint", "Team", "Original Assignee", "Current Assignee", " Type", "Scope Changes", "Description", "Jira #", " Status"]
 
 TABLE_DISPLAY_NAME = "Table1"
 TABLE_STYLE        = "TableStyleMedium7"
@@ -96,7 +103,7 @@ TYPE_FONT_COLORS = {
 
 MIN_SPRINT = 28  # ignore every sprint before this number
 
-SP_SYNC_COLS = (9, 11)  # I and K only — synced read-only from SharePoint; J is script-controlled
+SP_SYNC_COLS = (10, 12)  # J and L only — synced read-only from SharePoint; K is script-controlled
 JIRA_NOTE_RE  = re.compile(r'xlsx<([^>]*)>xlsx')
 
 VALIDATION_ROW_END    = 1000  # dropdowns cover data rows up to this row
@@ -105,13 +112,14 @@ _SELECTION_SPRINT_MAX = 100   # Selection!F extended up to this sprint number
 # Sprint Template column → Selection sheet source range for dropdown validation.
 # Sprint 28 lives at Selection!F29 (row = sprint + 1; row 1 is header).
 _COL_VALIDATIONS = {
-    "A": "Selection!$F$2:$F$33",  
-    "B": "Selection!$A$2:$A$26",  
-    "C": "Selection!$A$2:$A$26",  
-    "D": "Selection!$D$2:$D$6",   
-    "E": "Selection!$H$2:$H$4",   
-    "F": "Selection!$K$2:$K$3",   
-    "I": "Selection!$J$2:$J$5",
+    "A": "Selection!$F$2:$F$33",
+    "B": "Selection!$B$2:$B$5",   # Team (new)
+    "C": "Selection!$A$2:$A$27",  # Original Assignee (was B)
+    "D": "Selection!$A$2:$A$27",  # Current Assignee  (was C)
+    "E": "Selection!$D$2:$D$6",   # Type              (was D)
+    "F": "Selection!$H$2:$H$4",   # Scope             (was E)
+    "G": "Selection!$K$2:$K$3",   # Description Y/N   (was F)
+    "J": "Selection!$J$2:$J$5",   # was I
 }
 
 
@@ -168,6 +176,14 @@ def _assignee_nickname(display_name: str) -> str:
     if nick:
         return nick
     return display_name.split()[0]
+
+
+def _team_for_nickname(nickname):
+    """Return (display_name_or_None, sort_index) for an Original Assignee nickname/full name."""
+    idx = _ASSIGNEE_TO_TEAM_IDX.get(nickname)
+    if idx is None:
+        return None, _UNMATCHED_TEAM_IDX
+    return TEAM_NAMES[idx], idx
 
 
 def _adf_to_text(node) -> str:
@@ -298,7 +314,7 @@ def _determine_current_sprint_num(issues, ws) -> int:
     """
     Determine the current sprint number using three fallbacks in order:
       1. Highest active sprint from the Jira API.
-      2. Sprint number in cell B2 of the worksheet (manually maintained).
+      2. Sprint number in cell C2 of the worksheet (manually maintained).
       3. Highest closed sprint from the Jira API.
     """
     active, closed = [], []
@@ -315,9 +331,9 @@ def _determine_current_sprint_num(issues, ws) -> int:
     if active:
         return max(active)
     try:
-        b2 = int(ws.cell(row=2, column=2).value)
-        if b2 >= MIN_SPRINT:
-            return b2
+        c2 = int(ws.cell(row=2, column=3).value)
+        if c2 >= MIN_SPRINT:
+            return c2
     except (TypeError, ValueError):
         pass
     if closed:
@@ -399,7 +415,7 @@ def _ensure_sheet_setup(ws):
     ws.row_dimensions[3].height = 18.75
     ws.freeze_panes = "A4"
 
-    widths = {"A": 9.29, "B": 10.57, "C": 10.57, "D": 11.57, "E": 18.43, "G": 103.14, "H": 16.29}
+    widths = {"A": 9.29, "B": 9, "C": 10.57, "D": 10.57, "E": 11.57, "F": 18.43, "H": 103.14, "I": 16.29}
     for col_letter, width in widths.items():
         ws.column_dimensions[col_letter].width = width
 
@@ -432,13 +448,13 @@ def _ensure_data_validations(ws):
         ws.add_data_validation(dv)
 
 
-def _ensure_h_validation(ws) -> None:
+def _ensure_status_validation(ws) -> None:
     """
-    Apply data validation to column H (Status) based on the written values in column D (Type).
+    Apply data validation to column I (Status) based on the written values in column E (Type).
     Groups consecutive same-type rows into a single DataValidation range.
     Bug / Dialin ticket rows  →  Selection!$L$2:$L$14
     All other rows            →  Selection!$E$2:$E$7  (default, also covers future empty rows)
-    Must be called AFTER all data rows have been written so column D reflects current types.
+    Must be called AFTER all data rows have been written so column E reflects current types.
     """
     _BUG_DIALIN = {"Bug", "Dialin ticket"}
     _L_RANGE    = "Selection!$L$2:$L$13"
@@ -447,8 +463,8 @@ def _ensure_h_validation(ws) -> None:
     # Classify each written data row: True = Bug/Dialin, False = everything else
     row_types = []
     for row_idx in range(DATA_START_ROW, ws.max_row + 1):
-        d_val = ws.cell(row=row_idx, column=4).value
-        row_types.append((row_idx, d_val in _BUG_DIALIN))
+        e_val = ws.cell(row=row_idx, column=5).value
+        row_types.append((row_idx, e_val in _BUG_DIALIN))
 
     # Build (start_row, end_row, is_bug_dialin) groups of consecutive same-type rows
     groups = []
@@ -477,7 +493,7 @@ def _ensure_h_validation(ws) -> None:
             error="Please select from the dropdown list.",
             errorStyle="warning",
         )
-        dv.add(f"H{start_row}:H{end_row}")
+        dv.add(f"I{start_row}:I{end_row}")
         ws.add_data_validation(dv)
 
 
@@ -548,13 +564,14 @@ def _original_assignee_for_sprint(issue, sprint_obj) -> str:
 
 def _write_issue_row(ws, row_idx, row_record):
     """
-    Write one (issue, sprint) entry into columns A–H of the given row.
-    A=Sprint, B=OriginalAssignee, C=CurrentAssignee, D=Type, E=Scope, F=empty, G=Jira#, H=Status
-    row_record = {"issue": issue_obj, "sprint_num": int, "scope": str, "original_assignee": str}
+    Write one (issue, sprint) entry into columns A–I of the given row.
+    A=Sprint, B=Team, C=OriginalAssignee, D=CurrentAssignee, E=Type, F=Scope, G=empty, H=Jira#, I=Status
+    row_record = {"issue": issue_obj, "sprint_num": int, "scope": str, "original_assignee": str, "team": str|None}
     """
     issue      = row_record["issue"]
     sprint_num = row_record["sprint_num"]
     scope      = row_record["scope"]
+    team       = row_record.get("team")
 
     fields = issue["fields"]
     key    = issue["key"]
@@ -569,8 +586,8 @@ def _write_issue_row(ws, row_idx, row_record):
     has_description = "Y" if len(desc_text) > 20 else "N"
     status = get_status(issue)
 
-    # Column order: A          B                  C                D           E      F              G             H
-    values = [sprint_num, original_assignee, current_assignee, issue_type, scope, has_description, ticket_label, status]
+    # Column order: A          B     C                  D                E           F      G              H             I
+    values = [sprint_num, team, original_assignee, current_assignee, issue_type, scope, has_description, ticket_label, status]
 
     align = Alignment(horizontal="left", vertical="center")
 
@@ -578,21 +595,21 @@ def _write_issue_row(ws, row_idx, row_record):
         cell            = ws.cell(row=row_idx, column=col, value=value)
         cell.alignment  = align
         cell.protection = Protection(locked=False)
-        if col == 7:  # G — Jira # hyperlink
+        if col == 8:  # H — Jira # hyperlink
             cell.font      = Font(name="Calibri", size=11, color="1155CC", underline="single")
             cell.hyperlink = ticket_url
-        elif col == 4:  # D — Type
+        elif col == 5:  # E — Type
             cell.font      = Font(name="Calibri", size=11, color=TYPE_FONT_COLORS.get(issue_type, "000000"))
             cell.hyperlink = None
         else:
             cell.hyperlink = None
 
-    # Column J (10) — latest xlsx<...>xlsx Jira comment; skipped when None (leaves existing value)
+    # Column K (11) — latest xlsx<...>xlsx Jira comment; skipped when None (leaves existing value)
     jira_note = row_record.get("jira_note")
     if jira_note is not None:
-        cell_j            = ws.cell(row=row_idx, column=10, value=jira_note)
-        cell_j.alignment  = align
-        cell_j.protection = Protection(locked=False)
+        cell_k            = ws.cell(row=row_idx, column=11, value=jira_note)
+        cell_k.alignment  = align
+        cell_k.protection = Protection(locked=False)
 
 
 def _ensure_table_in_model(ws, new_ref: str) -> None:
@@ -675,7 +692,7 @@ def _patch_xlsx_table(xlsx_path: str, final_row: int,
     xr:uid is extracted from orig_table_xml (or openpyxl's output) when available so
     the table identity stays stable across runs.
     """
-    ref = f"A3:K{final_row}"
+    ref = f"A3:L{final_row}"
 
     with zipfile.ZipFile(xlsx_path, "r") as zin:
         table_paths = [n for n in zin.namelist()
@@ -736,6 +753,98 @@ def _sprint_started(sprint_num: int, sprint_map: dict) -> bool:
     return datetime.now(start_dt.tzinfo) >= start_dt
 
 
+_SORT_NUM_COLS = 12  # columns A–L
+
+
+def _snapshot_row(ws, row_idx, num_cols=_SORT_NUM_COLS):
+    """Capture full-fidelity per-cell state (value, style, hyperlink, comment) for a row."""
+    cells = []
+    for col in range(1, num_cols + 1):
+        cell = ws.cell(row=row_idx, column=col)
+        cells.append({
+            "value":         cell.value,
+            "font":          copy.copy(cell.font),
+            "fill":          copy.copy(cell.fill),
+            "border":        copy.copy(cell.border),
+            "alignment":     copy.copy(cell.alignment),
+            "number_format": cell.number_format,
+            "protection":    copy.copy(cell.protection),
+            "hyperlink":     copy.copy(cell.hyperlink),
+            "comment":       copy.copy(cell.comment),
+        })
+    return cells
+
+
+def _restore_row(ws, row_idx, snapshot):
+    """Write a snapshot captured by _snapshot_row back into row_idx."""
+    for col, state in enumerate(snapshot, start=1):
+        cell               = ws.cell(row=row_idx, column=col)
+        cell.value         = state["value"]
+        cell.font          = state["font"]
+        cell.fill          = state["fill"]
+        cell.border        = state["border"]
+        cell.alignment     = state["alignment"]
+        cell.number_format = state["number_format"]
+        cell.protection    = state["protection"]
+        cell.hyperlink     = state["hyperlink"]
+        cell.comment       = state["comment"]
+
+
+def _sort_sprint_blocks(ws, current_sprint_num) -> None:
+    """
+    Within each contiguous block of rows sharing the same sprint number (current sprint
+    and later only), reorder rows by the Original Assignee's team — FW, then SWVV, then
+    SW, then assignees not in any TEAMS list — and alphabetically by nickname within
+    each group. Rows already marked "Move out of Sprint" (column F) are frozen in place:
+    excluded from the reorder and from the set of positions other rows are written into.
+    """
+    # Find contiguous blocks of rows sharing the same sprint number in column A.
+    blocks = []  # (start_row, end_row, sprint_num)
+    row_idx = DATA_START_ROW
+    while row_idx <= ws.max_row:
+        try:
+            sprint_num = int(ws.cell(row=row_idx, column=1).value)
+        except (TypeError, ValueError):
+            row_idx += 1
+            continue
+        end_row = row_idx
+        while end_row + 1 <= ws.max_row:
+            try:
+                next_sprint = int(ws.cell(row=end_row + 1, column=1).value)
+            except (TypeError, ValueError):
+                break
+            if next_sprint != sprint_num:
+                break
+            end_row += 1
+        blocks.append((row_idx, end_row, sprint_num))
+        row_idx = end_row + 1
+
+    def _sort_key(snapshot):
+        nickname = snapshot[2]["value"]  # column C — Original Assignee
+        _, team_idx = _team_for_nickname(nickname)
+        return (team_idx, nickname or "")
+
+    for start_row, end_row, sprint_num in blocks:
+        if sprint_num < current_sprint_num:
+            continue
+
+        sortable_positions = []
+        snapshots = []
+        for r in range(start_row, end_row + 1):
+            if ws.cell(row=r, column=6).value == "Move out of Sprint":
+                continue
+            sortable_positions.append(r)
+            snapshots.append(_snapshot_row(ws, r))
+
+        if len(sortable_positions) <= 1:
+            continue
+
+        snapshots.sort(key=_sort_key)
+
+        for r, snapshot in zip(sortable_positions, snapshots):
+            _restore_row(ws, r, snapshot)
+
+
 def update_excel(input_path, issues):
     if not os.path.exists(input_path):
         raise FileNotFoundError(
@@ -773,7 +882,10 @@ def update_excel(input_path, issues):
     # Build api_map for current sprint and beyond only.
     # "Move out of Sprint" entries are excluded: the Remove operation handles those
     # by marking existing spreadsheet rows rather than inserting new changelog rows.
+    # Tickets whose ORIGINAL assignee belongs to SYS_TEAM are excluded entirely — recorded
+    # in sys_excluded so the REMOVE step can delete any existing rows for them outright.
     api_map = {}
+    sys_excluded = set()
     for issue in issues:
         for sprint_num, scope in get_sprint_history(issue, current_sprint_num):
             if sprint_num < current_sprint_num or scope == "Move out of Sprint":
@@ -784,19 +896,25 @@ def update_excel(input_path, issues):
                  if _sprint_num(s.get("name", "")) == sprint_num),
                 None
             )
+            original_assignee = _original_assignee_for_sprint(issue, sprint_obj)
+            team_name, team_idx = _team_for_nickname(original_assignee)
+            if team_idx == _SYS_TEAM_IDX:
+                sys_excluded.add(composite)
+                continue
             api_map[composite] = {
                 "issue":             issue,
                 "sprint_num":        sprint_num,
                 "scope":             scope,
                 "jira_note":         issue.get("_jira_note"),
-                "original_assignee": _original_assignee_for_sprint(issue, sprint_obj),
+                "original_assignee": original_assignee,
+                "team":              team_name,
             }
 
     # Build existing map for current sprint and beyond only.
     # Past sprint rows (sprint < current_sprint_num) are completely skipped.
     existing = {}  # composite → [row_idx, ...]
     for row_idx in range(DATA_START_ROW, ws.max_row + 1):
-        label      = ws.cell(row=row_idx, column=7).value
+        label      = ws.cell(row=row_idx, column=8).value
         sprint_val = ws.cell(row=row_idx, column=1).value
         key        = _extract_key(label)
         try:
@@ -813,7 +931,7 @@ def update_excel(input_path, issues):
     for composite, row_indices in existing.items():
         if composite in api_map:
             row_idx = row_indices[0]
-            if ws.cell(row=row_idx, column=5).value == "Move out of Sprint":
+            if ws.cell(row=row_idx, column=6).value == "Move out of Sprint":
                 updated.add(composite)
                 continue
             _write_issue_row(ws, row_idx, api_map[composite])
@@ -822,23 +940,32 @@ def update_excel(input_path, issues):
     # ── REMOVE ───────────────────────────────────────────────────────────────
     # Rows in the spreadsheet that are no longer in the Jira API for that sprint:
     # - Sprint hasn't started yet → delete the row (pre-planning churn, keep scope clean)
-    # - Sprint has started → write "Move out of Sprint" into column D, leave other cells
+    # - Sprint has started → write "Move out of Sprint" into column F, leave other cells
     # Already-marked rows are skipped so they are never overwritten again.
+    # Rows whose Original Assignee is in SYS_TEAM are deleted outright (not just marked),
+    # unless already frozen as "Move out of Sprint" — those are left completely untouched.
     rows_to_delete_unstarted = []
+    rows_to_delete_sys = []
     removed_count = 0
     for composite, row_indices in existing.items():
-        if composite not in api_map:
-            row_idx = row_indices[0]
-            sprint_num = composite[1]
-            if not _sprint_started(sprint_num, sprint_map):
-                rows_to_delete_unstarted.append(row_idx)
-            elif ws.cell(row=row_idx, column=5).value != "Move out of Sprint":
-                ws.cell(row=row_idx, column=5).value = "Move out of Sprint"
-                removed_count += 1
+        if composite in api_map:
+            continue
+        row_idx = row_indices[0]
+        if composite in sys_excluded:
+            if ws.cell(row=row_idx, column=6).value != "Move out of Sprint":
+                rows_to_delete_sys.append(row_idx)
+            continue
+        sprint_num = composite[1]
+        if not _sprint_started(sprint_num, sprint_map):
+            rows_to_delete_unstarted.append(row_idx)
+        elif ws.cell(row=row_idx, column=6).value != "Move out of Sprint":
+            ws.cell(row=row_idx, column=6).value = "Move out of Sprint"
+            removed_count += 1
 
-    # Delete: (a) rows removed from unstarted sprints, (b) duplicate rows beyond first.
-    # Always process in reverse order so earlier row indices are not shifted.
-    to_delete = list(rows_to_delete_unstarted)
+    # Delete: (a) rows removed from unstarted sprints, (b) SYS-excluded original-assignee
+    # rows, (c) duplicate rows beyond first. Always process in reverse order so earlier
+    # row indices are not shifted.
+    to_delete = list(rows_to_delete_unstarted) + list(rows_to_delete_sys)
     for row_indices in existing.values():
         to_delete.extend(row_indices[1:])
     to_delete.sort(reverse=True)
@@ -863,21 +990,23 @@ def update_excel(input_path, issues):
 
     # Remove trailing rows with no ticket data.
     for row_idx in range(ws.max_row, DATA_START_ROW - 1, -1):
-        if any(ws.cell(row=row_idx, column=c).value is not None for c in range(1, 9)):
+        if any(ws.cell(row=row_idx, column=c).value is not None for c in range(1, 10)):
             break
         ws.delete_rows(row_idx)
+
+    _sort_sprint_blocks(ws, current_sprint_num)
 
     final_row = ws.max_row
 
     if final_row >= DATA_START_ROW:
-        _ensure_table_in_model(ws, f"A3:K{final_row}")
+        _ensure_table_in_model(ws, f"A3:L{final_row}")
 
     col_names = [
         str(v) if (v := ws.cell(row=3, column=c).value) and str(v).strip() else f"Column{c}"
-        for c in range(1, 12)
+        for c in range(1, 13)
     ]
 
-    _ensure_h_validation(ws)
+    _ensure_status_validation(ws)
     wb.save(input_path)
 
     _patch_xlsx_table(input_path, final_row, orig_table_xml, col_names)
@@ -887,7 +1016,8 @@ def update_excel(input_path, issues):
         f"(current sprint: {current_sprint_num} | "
         f"{len(api_map)} active sprint-rows across {len(issues)} tickets | "
         f"{len(updated)} updated, {len(new_composites)} added, "
-        f"{removed_count} marked removed, {len(rows_to_delete_unstarted)} deleted (unstarted sprint))"
+        f"{removed_count} marked removed, {len(rows_to_delete_unstarted)} deleted (unstarted sprint), "
+        f"{len(rows_to_delete_sys)} deleted (SYS-team original assignee))"
     )
     return current_sprint_num
 
@@ -902,7 +1032,7 @@ def _is_file_locked(path: str) -> bool:
 
 def _sync_hplus(source_path: str, dest_path: str) -> None:
     """
-    Read H–J note values from source (SharePoint) and write them into dest (X: drive),
+    Read J/L note values from source (SharePoint) and write them into dest (X: drive),
     matched by (jira_key, sprint_num). SharePoint is the source of truth — even empty
     cells in source overwrite dest so deleted notes don't linger on the X: drive copy.
     """
@@ -910,7 +1040,7 @@ def _sync_hplus(source_path: str, dest_path: str) -> None:
     ws_src = wb_src[SHEET_NAME]
     hplus_map = {}
     for row_idx in range(DATA_START_ROW, ws_src.max_row + 1):
-        key = _extract_key(ws_src.cell(row=row_idx, column=7).value)
+        key = _extract_key(ws_src.cell(row=row_idx, column=8).value)
         try:
             sprint_num = int(ws_src.cell(row=row_idx, column=1).value)
         except (TypeError, ValueError):
@@ -925,7 +1055,7 @@ def _sync_hplus(source_path: str, dest_path: str) -> None:
     wb_dst = load_workbook(dest_path)
     ws_dst = wb_dst[SHEET_NAME]
     for row_idx in range(DATA_START_ROW, ws_dst.max_row + 1):
-        key = _extract_key(ws_dst.cell(row=row_idx, column=7).value)
+        key = _extract_key(ws_dst.cell(row=row_idx, column=8).value)
         try:
             sprint_num = int(ws_dst.cell(row=row_idx, column=1).value)
         except (TypeError, ValueError):
@@ -940,11 +1070,11 @@ def _sync_hplus(source_path: str, dest_path: str) -> None:
     final_row = ws_dst.max_row
     col_names = [
         str(v) if (v := ws_dst.cell(row=3, column=c).value) and str(v).strip() else f"Column{c}"
-        for c in range(1, 12)
+        for c in range(1, 13)
     ]
     wb_dst.save(dest_path)
     _patch_xlsx_table(dest_path, final_row, dest_table_xml, col_names)
-    print(f"H/J notes synced from SharePoint -> X: drive ({len(hplus_map)} rows read)")
+    print(f"J/L notes synced from SharePoint -> X: drive ({len(hplus_map)} rows read)")
 
 
 def _archive_excel(source_path: str, archive_dir: str) -> None:
