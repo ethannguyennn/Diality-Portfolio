@@ -19,23 +19,23 @@ function main(workbook: ExcelScript.Workbook): void {
     const SCOPES = ["Scoped", "Added", "Move out of Sprint"];
 
     const STATUS_COLORS: { [s: string]: string } = {
-        "Done": "#4FB06D",
-        "Blocked": "#BF2C34",
+        "Done":        "#4FB06D",
+        "Blocked":     "#BF2C34",
         "In-progress": "#F5c26B",
         "Not started": "#CBD6E2",
-        "On-hold": "#F07857"
+        "On-hold":     "#F07857"
     };
     const SCOPE_COLORS: { [s: string]: string } = {
-        "Scoped": "#4FB06D",
-        "Added": "#F07857",
+        "Scoped":             "#4FB06D",
+        "Added":              "#F07857",
         "Move out of Sprint": "#BF2C34"
     };
     const TYPE_COLORS: { [s: string]: string } = {
-        "Big-V": "#CBD6E2",
-        "Little-V": "#BE398D",
-        "Bug": "#BF2C34",
+        "Big-V":         "#CBD6E2",
+        "Little-V":      "#BE398D",
+        "Bug":           "#BF2C34",
         "Dialin ticket": "#F07857",
-        "Support": "#4FB06D"
+        "Support":       "#4FB06D"
     };
 
     const ROW_PT = 15;  // approx Excel row height in points (used for chart placement)
@@ -63,10 +63,10 @@ function main(workbook: ExcelScript.Workbook): void {
 
     const rows = rawData.filter(row => Number(row[C_SPRINT]) === sprint);
     if (!rows.length) throw new Error(`No rows found for Sprint ${sprint}.`);
-    
+
     function normalizeStatus(raw: string): string {
-        return STATUSES.includes(raw) ? raw : "In-progress";
-    }
+    return STATUSES.includes(raw) ? raw : "In-progress";
+}
 
     // ══════════════════════════════════════════════════════════════
     //  AGGREGATE
@@ -112,9 +112,9 @@ function main(workbook: ExcelScript.Workbook): void {
     const statusMap: { [k: string]: number } = {};
     STATUSES.forEach(s => (statusMap[s] = 0));
     rows.forEach(row => {
-        const s = normalizeStatus(String(row[C_STATUS]).trim());
-        if (statusMap[s] !== undefined) statusMap[s]++;
-    });
+    const s = normalizeStatus(String(row[C_STATUS]).trim());
+    if (statusMap[s] !== undefined) statusMap[s]++;
+      });
     const statusRows = STATUSES.map(s => [s, statusMap[s]] as [string, number]);
 
     // ══════════════════════════════════════════════════════════════
