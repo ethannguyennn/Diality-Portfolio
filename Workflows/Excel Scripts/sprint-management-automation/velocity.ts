@@ -63,6 +63,10 @@ function main(workbook: ExcelScript.Workbook): void {
 
     const rows = rawData.filter(row => Number(row[C_SPRINT]) === sprint);
     if (!rows.length) throw new Error(`No rows found for Sprint ${sprint}.`);
+    
+    function normalizeStatus(raw: string): string {
+        return STATUSES.includes(raw) ? raw : "In-progress";
+    }
 
     // ══════════════════════════════════════════════════════════════
     //  AGGREGATE
@@ -72,7 +76,7 @@ function main(workbook: ExcelScript.Workbook): void {
     const aMap: { [name: string]: { [status: string]: number } } = {};
     rows.forEach(row => {
         const name = String(row[C_ASSIGNEE]).trim() || "Unassigned";
-        const status = String(row[C_STATUS]).trim();
+        const status = normalizeStatus(String(row[C_STATUS]).trim());
         if (!aMap[name]) { aMap[name] = {}; STATUSES.forEach(s => (aMap[name][s] = 0)); }
         if (aMap[name][status] !== undefined) aMap[name][status]++;
     });
@@ -108,7 +112,7 @@ function main(workbook: ExcelScript.Workbook): void {
     const statusMap: { [k: string]: number } = {};
     STATUSES.forEach(s => (statusMap[s] = 0));
     rows.forEach(row => {
-        const s = String(row[C_STATUS]).trim();
+        const s = normalizeStatus(String(row[C_STATUS]).trim());
         if (statusMap[s] !== undefined) statusMap[s]++;
     });
     const statusRows = STATUSES.map(s => [s, statusMap[s]] as [string, number]);
