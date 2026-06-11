@@ -22,7 +22,7 @@ load_dotenv()
 BASE_URL = "https://diality.atlassian.net"
 PROJECT = "LDT"
 SHEET_NAME = "Sprint Template"
-DATA_START_ROW = 4  # Row 1=note banner, Row 2=sprint info, Row 3=headers, Row 4+=data
+DATA_START_ROW = 4  
 
 SWVV_TEAM = ["Raghu Kallala", "Thomas Lippold", "Tejaskumar Patel", "Tiffany Mejia",
              "Zoltan Miskolci", "Sarina Cheung", "Tisha Patel", "Ethan Nguyen"]
@@ -32,14 +32,10 @@ FW_TEAM   = ["Arpita Srivastava", "Jashwant Gantyada", "Michael Garthwaite", "Pr
 SW_TEAM   = ["Nicholas Ramirez", "Stephen Quong", "Dara Navaei", "Behrouz NematiPour"]
 SYS_TEAM  = ["Eliza Petersen", "Caitlynn Chang", "Christina Heine", "Abhijit Barman", "Chris Yu", "Vitas Buenaventura", "Emiline Hernandez"]
 TEAMS = [FW_TEAM, SWVV_TEAM, SW_TEAM, SYS_TEAM]
-
-# Display label for the "Team" column, aligned 1:1 with TEAMS indices.
 TEAM_NAMES = ["FW", "SWVV", "SW", "SYS"]
-_SYS_TEAM_IDX       = len(TEAMS) - 1  # SYS_TEAM's index in TEAMS — original assignees here are excluded entirely
-_UNMATCHED_TEAM_IDX = len(TEAMS)      # sort bucket for assignees not in any TEAMS list
+_SYS_TEAM_IDX       = len(TEAMS) - 1  
+_UNMATCHED_TEAM_IDX = len(TEAMS)      
 
-# Full Jira display name → nickname used in the Selection sheet dropdowns.
-# Non-obvious entries are listed first; straightforward first-name entries follow.
 NICKNAME_MAP = {
     "Tejaskumar Patel":       "Tejas",
     "Nicholas Ramirez":       "Nico",
@@ -73,7 +69,6 @@ NICKNAME_MAP = {
     "Emiline Hernandez":      "Emiline",
 }
 
-# Lookup from assignee name (full Jira OR nickname) → team sort index.
 _ASSIGNEE_TO_TEAM_IDX: dict = {}
 for _ti, _team in enumerate(TEAMS):
     for _full in _team:
@@ -85,8 +80,7 @@ for _ti, _team in enumerate(TEAMS):
 SHAREPOINT_SYNC_PATH = os.getenv("SHAREPOINT_SYNC_PATH", "").strip()
 ARCHIVE_PATH         = os.getenv("ARCHIVE_PATH", "").strip()
 
-# Column headers written to row 3 — must match cell values exactly (leading spaces intentional).
-# Used by both _ensure_sheet_setup and _generate_table_xml so they stay in sync.
+# Column headers written to row 3 
 SHEET_HEADERS = ["Sprint", "Team", "Original Assignee", "Current Assignee", " Type", "Scope Changes", "Description", "Jira #", " Status"]
 
 TABLE_DISPLAY_NAME = "Table1"
@@ -101,11 +95,7 @@ TYPE_FONT_COLORS = {
 }
 
 # Issue types whose Status column uses the Bug/Dialin-specific dropdown
-# (Selection!L2:L13) instead of the generic Status dropdown (Selection!E2:E7).
 BUG_DIALIN_TYPES = {"Bug", "Dialin ticket"}
-
-# Maps the raw Jira status name (for Bug / Dialin ticket issue types) to the
-# matching label in the Selection!L2:L13 dropdown list.
 BUG_STATUS_MAP = {
     "More Info Needed":                       "More Info Needed",
     "On Hold":                                 "On Hold",
@@ -121,17 +111,14 @@ BUG_STATUS_MAP = {
     "Done":                                    "Done",
 }
 
+MIN_SPRINT = 28  
 
-MIN_SPRINT = 28  # ignore every sprint before this number
-
-SP_SYNC_COLS = (10, 12)  # J and L only — synced read-only from SharePoint; K is script-controlled
+SP_SYNC_COLS = (10, 12)  
 JIRA_NOTE_RE  = re.compile(r'xlsx<([^>]*)>xlsx')
 
-VALIDATION_ROW_END    = 1000  # dropdowns cover data rows up to this row
-_SELECTION_SPRINT_MAX = 100   # Selection!F extended up to this sprint number
+VALIDATION_ROW_END    = 1000   
+_SELECTION_SPRINT_MAX = 100   
 
-# Sprint Template column → Selection sheet source range for dropdown validation.
-# Sprint 28 lives at Selection!F29 (row = sprint + 1; row 1 is header).
 _COL_VALIDATIONS = {
     "A": "Selection!$F$2:$F$33",
     "B": "Selection!$B$2:$B$5",   # Team (new)
@@ -142,9 +129,6 @@ _COL_VALIDATIONS = {
     "G": "Selection!$K$2:$K$3",   # Description Y/N   (was F)
     "J": "Selection!$J$2:$J$5",   # was I
 }
-
-
-# ── Jira fetch ────────────────────────────────────────────────────────────────
 
 def _fetch_paginated(url, jql, auth):
     all_issues = []
@@ -168,13 +152,11 @@ def _fetch_paginated(url, jql, auth):
             break
     return all_issues
 
-
 def _sprint_names(s):
     return {n.strip() for n in s.split(",") if n.strip()} if s else set()
 
-
 def _has_sprint_history(issue):
-    """Return True if the changelog contains a Sprint transition into sprint >= MIN_SPRINT."""
+    # Return True if the changelog contains a Sprint transition into sprint >= MIN_SPRINT.
     for history in issue["changelog"]["histories"]:
         for item in history["items"]:
             if item["field"] != "Sprint":
@@ -186,11 +168,7 @@ def _has_sprint_history(issue):
 
 
 def _assignee_nickname(display_name: str) -> str:
-    """
-    Convert a full Jira display name to the Selection-sheet nickname.
-    Checks NICKNAME_MAP first; falls back to the first word of the display name
-    for people not yet in the map (so 'Jane Doe' becomes 'Jane').
-    """
+    # Convert a full Jira display name to the Selection-sheet nickname.
     if not display_name:
         return "Unassigned"
     nick = NICKNAME_MAP.get(display_name)
@@ -198,9 +176,7 @@ def _assignee_nickname(display_name: str) -> str:
         return nick
     return display_name.split()[0]
 
-
 def _team_for_nickname(nickname):
-    """Return (display_name_or_None, sort_index) for an Original Assignee nickname/full name."""
     idx = _ASSIGNEE_TO_TEAM_IDX.get(nickname)
     if idx is None:
         return None, _UNMATCHED_TEAM_IDX
@@ -208,7 +184,6 @@ def _team_for_nickname(nickname):
 
 
 def _adf_to_text(node) -> str:
-    """Recursively extract plain text from an Atlassian Document Format node or plain string."""
     if isinstance(node, str):
         return node
     if not isinstance(node, dict):
@@ -219,11 +194,6 @@ def _adf_to_text(node) -> str:
 
 
 def _latest_jira_note(issue, auth) -> str:
-    """
-    Return the trimmed text from the latest xlsx<...>xlsx comment on this issue, or None.
-    If the main issue fetch returned fewer comments than the total, fetches all comments
-    via the comments endpoint before searching.
-    """
     comment_field = issue["fields"].get("comment") or {}
     comments = list(comment_field.get("comments", []))
     total = comment_field.get("total", len(comments))
@@ -273,13 +243,9 @@ def get_jira_issues():
         issue["_jira_note"] = _latest_jira_note(issue, auth)
     return all_issues
 
-
-# ── Sprint / issue field helpers ──────────────────────────────────────────────
-
 def _sprint_num(name):
     m = re.search(r'(\d+)', name)
     return int(m.group(1)) if m else -1
-
 
 def get_type(issue):
     issuetype = issue["fields"]["issuetype"]["name"].lower()
@@ -296,14 +262,12 @@ def get_type(issue):
     else:
         return "Big-V"
 
-
 def parse_date(date_str):
     if not date_str:
         return None
     date_str = date_str.replace("Z", "+00:00")
     date_str = re.sub(r'([+-])(\d{2})(\d{2})$', r'\1\2:\3', date_str)
     return datetime.fromisoformat(date_str)
-
 
 def _classify_sprint_timing(sprint, histories):
     sprint_name     = sprint["name"]
@@ -332,12 +296,6 @@ def _classify_sprint_timing(sprint, histories):
 
 
 def _determine_current_sprint_num(issues, ws) -> int:
-    """
-    Determine the current sprint number using three fallbacks in order:
-      1. Highest active sprint from the Jira API.
-      2. Sprint number in cell B2 of the worksheet (manually maintained).
-      3. Highest closed sprint from the Jira API.
-    """
     active, closed = [], []
     for issue in issues:
         for s in (issue["fields"].get("customfield_10020") or []):
@@ -381,24 +339,20 @@ def get_sprint_history(issue, current_sprint_num):
             for name in _sprint_names(item.get("toString") or ""):
                 all_sprint_names.add(name)
 
-    sprint_entries = {}  # sprint_num → scope
-
-    # Pass 1: changelog-only sprints → ticket was manually removed from each.
-    # Only label as "Move out of Sprint" for current sprint and earlier; future sprint
-    # removals are skipped entirely since those issues were never discussed in that sprint.
+    sprint_entries = {}  
     for name in all_sprint_names:
         if name not in current_sprint_names:
             num = _sprint_num(name)
             if num >= MIN_SPRINT and num <= current_sprint_num:
                 sprint_entries[num] = "Move out of Sprint"
 
-    # Pass 2: currently-held sprints → timing classification overwrites any conflict
+    
     for name, sprint_obj in current_sprint_objs.items():
         num = _sprint_num(name)
         if num >= MIN_SPRINT:
             sprint_entries[num] = _classify_sprint_timing(sprint_obj, histories)
 
-    return sorted(sprint_entries.items(), key=lambda x: x[0])  # [(sprint_num, scope), ...]
+    return sorted(sprint_entries.items(), key=lambda x: x[0])  
 
 
 def get_status(issue, issue_type) -> str:
@@ -429,9 +383,6 @@ def _extract_key(label):
     m = re.match(r'\[([A-Z]+-\d+)\]', str(label) if label is not None else '')
     return m.group(1) if m else None
 
-
-# ── Excel helpers ─────────────────────────────────────────────────────────────
-
 def _ensure_sheet_setup(ws):
     for col, header in enumerate(SHEET_HEADERS, start=1):
         cell = ws.cell(row=3, column=col)
@@ -447,7 +398,6 @@ def _ensure_sheet_setup(ws):
 
 
 def _ensure_selection_sprints(wb):
-    """Extend Selection!F sprint list to _SELECTION_SPRINT_MAX if it falls short."""
     if "Selection" not in wb.sheetnames:
         return
     ws_sel = wb["Selection"]
@@ -458,7 +408,6 @@ def _ensure_selection_sprints(wb):
 
 
 def _ensure_data_validations(ws):
-    """Apply dropdown validation to cols A-E and G for all data rows."""
     ws.data_validations = DataValidationList()
     for col_letter, formula in _COL_VALIDATIONS.items():
         dv = DataValidation(
@@ -475,23 +424,15 @@ def _ensure_data_validations(ws):
 
 
 def _ensure_status_validation(ws) -> None:
-    """
-    Apply data validation to column I (Status) based on the written values in column E (Type).
-    Groups consecutive same-type rows into a single DataValidation range.
-    Bug / Dialin ticket rows  →  Selection!$L$2:$L$14
-    All other rows            →  Selection!$E$2:$E$7  (default, also covers future empty rows)
-    Must be called AFTER all data rows have been written so column E reflects current types.
-    """
+    # Apply data validation to column I 
     _L_RANGE = "Selection!$L$2:$L$13"
     _E_RANGE = "Selection!$E$2:$E$7"
 
-    # Classify each written data row: True = Bug/Dialin, False = everything else
     row_types = []
     for row_idx in range(DATA_START_ROW, ws.max_row + 1):
         e_val = ws.cell(row=row_idx, column=5).value
         row_types.append((row_idx, e_val in BUG_DIALIN_TYPES))
 
-    # Build (start_row, end_row, is_bug_dialin) groups of consecutive same-type rows
     groups = []
     if row_types:
         cur_start, cur_type = row_types[0]
@@ -505,7 +446,6 @@ def _ensure_status_validation(ws) -> None:
         if last_data_row < VALIDATION_ROW_END:
             groups.append((last_data_row + 1, VALIDATION_ROW_END, False))
     else:
-        # No data rows at all — apply default to the entire expected range
         groups.append((DATA_START_ROW, VALIDATION_ROW_END, False))
 
     for start_row, end_row, is_bug_dialin in groups:
@@ -538,7 +478,6 @@ def _original_assignee_for_sprint(issue, sprint_obj) -> str:
 
     sprint_name = sprint_obj.get("name", "")
 
-    # Find the earliest timestamp when this ticket was added to the sprint
     sprint_added_dt = None
     for history in histories:
         for item in history["items"]:
@@ -553,10 +492,6 @@ def _original_assignee_for_sprint(issue, sprint_obj) -> str:
 
     if sprint_added_dt is None:
         return _assignee_nickname(current_full)
-
-    # Scoped tickets use EOD of sprint start; Added tickets use the sprint entry moment.
-    # max() picks the later of the two, which is sprint_start_eod for Scoped and
-    # sprint_added_dt for Added — matching _classify_sprint_timing's EOD definition.
     sprint_start_dt = parse_date(sprint_obj.get("startDate"))
     if sprint_start_dt:
         sprint_start_eod = sprint_start_dt.replace(hour=23, minute=59, second=59, microsecond=0)
@@ -564,7 +499,6 @@ def _original_assignee_for_sprint(issue, sprint_obj) -> str:
     else:
         cutoff_dt = sprint_added_dt
 
-    # Collect all assignee changes sorted oldest first
     assignee_changes = []
     for history in histories:
         for item in history["items"]:
@@ -575,8 +509,6 @@ def _original_assignee_for_sprint(issue, sprint_obj) -> str:
     if not assignee_changes:
         return _assignee_nickname(current_full)
 
-    # The state before the first ever change is fromString of the earliest change.
-    # Apply each change forward up to and including the cutoff.
     current_state = assignee_changes[0][1].get("fromString") or ""
     for change_dt, item in assignee_changes:
         if change_dt <= cutoff_dt:
@@ -588,11 +520,6 @@ def _original_assignee_for_sprint(issue, sprint_obj) -> str:
 
 
 def _write_issue_row(ws, row_idx, row_record):
-    """
-    Write one (issue, sprint) entry into columns A–I of the given row.
-    A=Sprint, B=Team, C=OriginalAssignee, D=CurrentAssignee, E=Type, F=Scope, G=empty, H=Jira#, I=Status
-    row_record = {"issue": issue_obj, "sprint_num": int, "scope": str, "original_assignee": str, "team": str|None}
-    """
     issue      = row_record["issue"]
     sprint_num = row_record["sprint_num"]
     scope      = row_record["scope"]
@@ -629,7 +556,6 @@ def _write_issue_row(ws, row_idx, row_record):
         else:
             cell.hyperlink = None
 
-    # Column K (11) — latest xlsx<...>xlsx Jira comment; skipped when None (leaves existing value)
     jira_note = row_record.get("jira_note")
     if jira_note is not None:
         cell_k            = ws.cell(row=row_idx, column=11, value=jira_note)
@@ -664,12 +590,6 @@ def _xml_attr(value: str) -> str:
 
 
 def _generate_table_xml(ref: str, col_names: list, uid: str = None) -> bytes:
-    """
-    Build a complete OOXML table1.xml with proper namespace declarations and xr:uid.
-    xr:uid is required by SharePoint/Excel 365 to avoid the 'Repaired Records' dialog.
-    If uid is provided (extracted from a previous version of the file) it is reused so
-    the table identity stays stable across script runs.
-    """
     xr_uid = uid or ("{" + str(uuid.uuid4()).upper() + "}")
     cols_xml = "".join(
         f'<tableColumn id="{i + 1}" name="{_xml_attr(n)}"/>'
@@ -693,12 +613,6 @@ def _generate_table_xml(ref: str, col_names: list, uid: str = None) -> bytes:
 
 
 def _capture_table_xml(xlsx_path: str) -> tuple:
-    """
-    Read the original table XML from the xlsx zip BEFORE openpyxl loads it.
-    Returns (zip_entry_path, xml_str) or (None, None) if no table found.
-    Preserving the original lets _patch_xlsx_table keep Excel-specific attributes
-    (xr3:uid, namespace declarations, etc.) that openpyxl silently drops on save.
-    """
     with zipfile.ZipFile(xlsx_path, "r") as z:
         table_paths = [n for n in z.namelist()
                        if n.startswith("xl/tables/") and n.endswith(".xml")]
@@ -710,13 +624,7 @@ def _capture_table_xml(xlsx_path: str) -> tuple:
 
 def _patch_xlsx_table(xlsx_path: str, final_row: int,
                       orig_table_xml: str = None, col_names: list = None) -> None:
-    """
-    After openpyxl saves, replace table1.xml with a clean, fully-formed version.
-    col_names drives _generate_table_xml, which writes proper namespace declarations
-    and xr:uid — the attributes SharePoint requires to avoid the repair dialog.
-    xr:uid is extracted from orig_table_xml (or openpyxl's output) when available so
-    the table identity stays stable across runs.
-    """
+    
     ref = f"A3:L{final_row}"
 
     with zipfile.ZipFile(xlsx_path, "r") as zin:
@@ -741,15 +649,7 @@ def _patch_xlsx_table(xlsx_path: str, final_row: int,
     with open(xlsx_path, "wb") as f:
         f.write(buf.getvalue())
 
-
-# ── Main update logic ─────────────────────────────────────────────────────────
-
 def _insert_point_for_sprint(ws, sprint_num):
-    """
-    Return the row index after which new rows for sprint_num should be inserted.
-    Scans for the last row where col-A sprint number <= sprint_num; new rows go after it.
-    If no such row exists, returns DATA_START_ROW - 1 so rows are inserted at the top.
-    """
     result = DATA_START_ROW - 1
     for row_idx in range(DATA_START_ROW, ws.max_row + 1):
         try:
@@ -762,10 +662,10 @@ def _insert_point_for_sprint(ws, sprint_num):
 
 
 def _sprint_started(sprint_num: int, sprint_map: dict) -> bool:
-    """Return True if the sprint has started (active or closed), False if future/unstarted."""
+    # Return True if the sprint has started (active or closed), False if future/unstarted
     s = sprint_map.get(sprint_num)
     if not s:
-        return True  # unknown sprint — safe default is to treat as started
+        return True  
     state = s.get("state", "")
     if state in ("active", "closed"):
         return True
@@ -778,7 +678,7 @@ def _sprint_started(sprint_num: int, sprint_map: dict) -> bool:
     return datetime.now(start_dt.tzinfo) >= start_dt
 
 
-_SORT_NUM_COLS = 12  # columns A–L
+_SORT_NUM_COLS = 12  
 
 
 def _snapshot_row(ws, row_idx, num_cols=_SORT_NUM_COLS):
@@ -816,13 +716,6 @@ def _restore_row(ws, row_idx, snapshot):
 
 
 def _sort_sprint_blocks(ws, current_sprint_num) -> None:
-    """
-    Within the contiguous block of rows for the current sprint only, reorder rows by
-    the Original Assignee's team — FW, then SWVV, then SW, then assignees not in any
-    TEAMS list — and alphabetically by nickname within each group. Rows already marked
-    "Move out of Sprint" (column F) are frozen in place: excluded from the reorder and
-    from the set of positions other rows are written into.
-    """
     # Find contiguous blocks of rows sharing the same sprint number in column A.
     blocks = []  # (start_row, end_row, sprint_num)
     row_idx = DATA_START_ROW
@@ -893,8 +786,6 @@ def update_excel(input_path, issues):
     _ensure_selection_sprints(wb)
     _ensure_data_validations(ws)
 
-    # Determine the managed sprint. Rows for any other sprint (past or future) are
-    # never touched.
     current_sprint_num = _determine_current_sprint_num(issues, ws)
 
     # Build sprint_map: sprint_num → sprint_obj (for startDate/state checks in REMOVE).
@@ -906,10 +797,6 @@ def update_excel(input_path, issues):
                 sprint_map[num] = s
 
     # Build api_map for the current sprint only.
-    # "Move out of Sprint" entries are excluded: the Remove operation handles those
-    # by marking existing spreadsheet rows rather than inserting new changelog rows.
-    # Tickets whose ORIGINAL assignee belongs to SYS_TEAM are excluded entirely — recorded
-    # in sys_excluded so the REMOVE step can delete any existing rows for them outright.
     api_map = {}
     sys_excluded = set()
     for issue in issues:
@@ -936,9 +823,7 @@ def update_excel(input_path, issues):
                 "team":              team_name,
             }
 
-    # Build existing map for the current sprint only.
-    # Rows for any other sprint (past or future) are completely skipped/frozen.
-    existing = {}  # composite → [row_idx, ...]
+    existing = {}  
     for row_idx in range(DATA_START_ROW, ws.max_row + 1):
         label      = ws.cell(row=row_idx, column=8).value
         sprint_val = ws.cell(row=row_idx, column=1).value
@@ -950,9 +835,6 @@ def update_excel(input_path, issues):
         if key and sprint_num is not None and sprint_num == current_sprint_num:
             existing.setdefault((key, sprint_num), []).append(row_idx)
 
-    # ── UPDATE ────────────────────────────────────────────────────────────────
-    # Rows present in both the spreadsheet and the API: refresh all fields.
-    # Rows already marked "Move out of Sprint" are frozen and skipped entirely.
     updated = set()
     for composite, row_indices in existing.items():
         if composite in api_map:
@@ -963,13 +845,6 @@ def update_excel(input_path, issues):
             _write_issue_row(ws, row_idx, api_map[composite])
             updated.add(composite)
 
-    # ── REMOVE ───────────────────────────────────────────────────────────────
-    # Rows in the spreadsheet that are no longer in the Jira API for that sprint:
-    # - Sprint hasn't started yet → delete the row (pre-planning churn, keep scope clean)
-    # - Sprint has started → write "Move out of Sprint" into column F, leave other cells
-    # Already-marked rows are skipped so they are never overwritten again.
-    # Rows whose Original Assignee is in SYS_TEAM are deleted outright (not just marked),
-    # unless already frozen as "Move out of Sprint" — those are left completely untouched.
     rows_to_delete_unstarted = []
     rows_to_delete_sys = []
     removed_count = 0
@@ -988,9 +863,6 @@ def update_excel(input_path, issues):
             ws.cell(row=row_idx, column=6).value = "Move out of Sprint"
             removed_count += 1
 
-    # Delete: (a) rows removed from unstarted sprints, (b) SYS-excluded original-assignee
-    # rows, (c) duplicate rows beyond first. Always process in reverse order so earlier
-    # row indices are not shifted.
     to_delete = list(rows_to_delete_unstarted) + list(rows_to_delete_sys)
     for row_indices in existing.values():
         to_delete.extend(row_indices[1:])
@@ -998,9 +870,6 @@ def update_excel(input_path, issues):
     for row_idx in to_delete:
         ws.delete_rows(row_idx)
 
-    # ── ADD ───────────────────────────────────────────────────────────────────
-    # Tickets in the API with no row in the spreadsheet yet: insert at the bottom
-    # of the current sprint's section.
     new_composites = [c for c in api_map if c not in existing]
     if new_composites:
         insert_after = _insert_point_for_sprint(ws, current_sprint_num)
@@ -1008,7 +877,6 @@ def update_excel(input_path, issues):
         for j, composite in enumerate(new_composites):
             _write_issue_row(ws, insert_after + 1 + j, api_map[composite])
 
-    # Remove trailing rows with no ticket data.
     for row_idx in range(ws.max_row, DATA_START_ROW - 1, -1):
         if any(ws.cell(row=row_idx, column=c).value is not None for c in range(1, 10)):
             break
@@ -1051,11 +919,6 @@ def _is_file_locked(path: str) -> bool:
 
 
 def _sync_hplus(source_path: str, dest_path: str) -> None:
-    """
-    Read J/L note values from source (SharePoint) and write them into dest (X: drive),
-    matched by (jira_key, sprint_num). SharePoint is the source of truth — even empty
-    cells in source overwrite dest so deleted notes don't linger on the X: drive copy.
-    """
     wb_src = load_workbook(source_path, data_only=True)
     ws_src = wb_src[SHEET_NAME]
     hplus_map = {}
@@ -1098,11 +961,6 @@ def _sync_hplus(source_path: str, dest_path: str) -> None:
 
 
 def _archive_excel(source_path: str, archive_dir: str) -> None:
-    """
-    Copy source_path into archive_dir with today's date (MMDDYYYY) appended to the stem.
-    Raises RuntimeError if the directory doesn't exist or the copy fails, so the script
-    aborts before any changes are made to the source file.
-    """
     if not os.path.isdir(archive_dir):
         raise RuntimeError(
             f"ARCHIVE_PATH does not exist or is not a directory: '{archive_dir}'. "
