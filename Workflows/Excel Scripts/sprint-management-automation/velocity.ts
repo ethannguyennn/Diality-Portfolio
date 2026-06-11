@@ -8,10 +8,10 @@ function main(workbook: ExcelScript.Workbook): void {
 
     // 0-based column indices  (A=0  B=1  C=2 … H=7)
     const C_SPRINT = 0; // A — Sprint #
-    const C_ASSIGNEE = 2; // C — Current Assignee  (B = Original, ignored)
-    const C_TYPE = 3; // D — Process Type
-    const C_SCOPE = 4; // E — Scope Changes
-    const C_STATUS = 7; // H — Ticket Status
+    const C_ASSIGNEE = 3; // D — Current Assignee  (C = Original, ignored)
+    const C_TYPE = 4; // E — Process Type
+    const C_SCOPE = 5; // F — Scope Changes
+    const C_STATUS = 8; // I — Ticket Status
 
     // Exact string values from the reference sheet
     const STATUSES = ["Blocked", "Done", "In-progress", "Not started", "On-hold", "N/A"];
@@ -53,7 +53,7 @@ function main(workbook: ExcelScript.Workbook): void {
 
     const used = dataSheet.getUsedRange();
     const numRows = used.getRowCount();
-    const numCols = Math.max(8, used.getColumnCount());
+    const numCols = Math.max(9, used.getColumnCount());
 
     // Sheet layout: Row 1 = title area | Row 2 = metadata (B2 = sprint#)
     //               Row 3 = column headers | Row 4+ = data  →  start at index 3
