@@ -120,7 +120,7 @@ VALIDATION_ROW_END    = 1000
 _SELECTION_SPRINT_MAX = 100   
 
 _COL_VALIDATIONS = {
-    "A": "Selection!$F$2:$F$33",
+    "A": f"Selection!$F$2:$F${_SELECTION_SPRINT_MAX + 1}",
     "B": "Selection!$B$2:$B$5",   # Team (new)
     "C": "Selection!$A$2:$A$27",  # Original Assignee (was B)
     "D": "Selection!$A$2:$A$27",  # Current Assignee  (was C)
@@ -320,7 +320,7 @@ def _determine_current_sprint_num(issues, ws) -> int:
     return MIN_SPRINT
 
 
-def get_sprint_history(issue, current_sprint_num):
+def get_sprint_history(issue, max_sprint_num):
     fields      = issue["fields"]
     histories   = issue["changelog"]["histories"]
     sprint_info = fields.get("customfield_10020") or []
@@ -339,11 +339,11 @@ def get_sprint_history(issue, current_sprint_num):
             for name in _sprint_names(item.get("toString") or ""):
                 all_sprint_names.add(name)
 
-    sprint_entries = {}  
+    sprint_entries = {}
     for name in all_sprint_names:
         if name not in current_sprint_names:
             num = _sprint_num(name)
-            if num >= MIN_SPRINT and num <= current_sprint_num:
+            if num >= MIN_SPRINT and num <= max_sprint_num:
                 sprint_entries[num] = "Move out of Sprint"
 
     
@@ -715,7 +715,7 @@ def _restore_row(ws, row_idx, snapshot):
         cell.comment       = state["comment"]
 
 
-def _sort_sprint_blocks(ws, current_sprint_num) -> None:
+def _sort_sprint_blocks(ws, target_sprints) -> None:
     # Find contiguous blocks of rows sharing the same sprint number in column A.
     blocks = []  # (start_row, end_row, sprint_num)
     row_idx = DATA_START_ROW
@@ -743,7 +743,7 @@ def _sort_sprint_blocks(ws, current_sprint_num) -> None:
         return (team_idx, nickname or "")
 
     for start_row, end_row, sprint_num in blocks:
-        if sprint_num != current_sprint_num:
+        if sprint_num not in target_sprints:
             continue
 
         sortable_positions = []
@@ -787,6 +787,9 @@ def update_excel(input_path, issues):
     _ensure_data_validations(ws)
 
     current_sprint_num = _determine_current_sprint_num(issues, ws)
+    next_sprint_num    = current_sprint_num + 1
+    target_sprints     = (current_sprint_num, next_sprint_num)
+    target_sprint_set  = set(target_sprints)
 
     # Build sprint_map: sprint_num → sprint_obj (for startDate/state checks in REMOVE).
     sprint_map: dict = {}
@@ -796,12 +799,12 @@ def update_excel(input_path, issues):
             if num >= MIN_SPRINT and num not in sprint_map:
                 sprint_map[num] = s
 
-    # Build api_map for the current sprint only.
+    # Build api_map for the current sprint and the next sprint.
     api_map = {}
     sys_excluded = set()
     for issue in issues:
-        for sprint_num, scope in get_sprint_history(issue, current_sprint_num):
-            if sprint_num != current_sprint_num or scope == "Move out of Sprint":
+        for sprint_num, scope in get_sprint_history(issue, next_sprint_num):
+            if sprint_num not in target_sprint_set or scope == "Move out of Sprint":
                 continue
             composite = (issue["key"], sprint_num)
             sprint_obj = next(
@@ -832,7 +835,7 @@ def update_excel(input_path, issues):
             sprint_num = int(sprint_val) if sprint_val is not None else None
         except (ValueError, TypeError):
             sprint_num = None
-        if key and sprint_num is not None and sprint_num == current_sprint_num:
+        if key and sprint_num is not None and sprint_num in target_sprint_set:
             existing.setdefault((key, sprint_num), []).append(row_idx)
 
     updated = set()
@@ -871,10 +874,13 @@ def update_excel(input_path, issues):
         ws.delete_rows(row_idx)
 
     new_composites = [c for c in api_map if c not in existing]
-    if new_composites:
-        insert_after = _insert_point_for_sprint(ws, current_sprint_num)
-        ws.insert_rows(insert_after + 1, len(new_composites))
-        for j, composite in enumerate(new_composites):
+    for sprint_num in target_sprints:
+        sprint_new = [c for c in new_composites if c[1] == sprint_num]
+        if not sprint_new:
+            continue
+        insert_after = _insert_point_for_sprint(ws, sprint_num)
+        ws.insert_rows(insert_after + 1, len(sprint_new))
+        for j, composite in enumerate(sprint_new):
             _write_issue_row(ws, insert_after + 1 + j, api_map[composite])
 
     for row_idx in range(ws.max_row, DATA_START_ROW - 1, -1):
@@ -882,7 +888,7 @@ def update_excel(input_path, issues):
             break
         ws.delete_rows(row_idx)
 
-    _sort_sprint_blocks(ws, current_sprint_num)
+    _sort_sprint_blocks(ws, target_sprint_set)
 
     final_row = ws.max_row
 
@@ -901,7 +907,7 @@ def update_excel(input_path, issues):
 
     print(
         f"Saved: {input_path} "
-        f"(current sprint: {current_sprint_num} | "
+        f"(sprints: {current_sprint_num} (current), {next_sprint_num} (next) | "
         f"{len(api_map)} active sprint-rows across {len(issues)} tickets | "
         f"{len(updated)} updated, {len(new_composites)} added, "
         f"{removed_count} marked removed, {len(rows_to_delete_unstarted)} deleted (unstarted sprint), "
