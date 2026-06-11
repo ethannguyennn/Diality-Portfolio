@@ -100,6 +100,27 @@ TYPE_FONT_COLORS = {
     "Big-V":        "000000",
 }
 
+# Issue types whose Status column uses the Bug/Dialin-specific dropdown
+# (Selection!L2:L13) instead of the generic Status dropdown (Selection!E2:E7).
+BUG_DIALIN_TYPES = {"Bug", "Dialin ticket"}
+
+# Maps the raw Jira status name (for Bug / Dialin ticket issue types) to the
+# matching label in the Selection!L2:L13 dropdown list.
+BUG_STATUS_MAP = {
+    "More Info Needed":                       "More Info Needed",
+    "On Hold":                                 "On Hold",
+    "Blocked":                                 "Blocked",
+    "Ready for SW/FW Implementation":          "Ready for SW/FW Implementation",
+    "Investigation In Progress (SW/FW)":       "Investigation in Progress",
+    "Fix In Progress":                         "Fix in Progress",
+    "Ready for Fix to be Tested":              "Ready for Fix to be Tested",
+    "Testing Fix in Progress":                 "Testing Fix in Progress",
+    "Test Passed - Ready for Updated Release": "Ready for Updated Release",
+    "Test Failed - SW/FW Fix Needed":          "SW/FW Fix Needed",
+    "Test Passed - Needs Final Fix Details":   "Needs Final Fix Details",
+    "Done":                                    "Done",
+}
+
 
 MIN_SPRINT = 28  # ignore every sprint before this number
 
@@ -314,7 +335,7 @@ def _determine_current_sprint_num(issues, ws) -> int:
     """
     Determine the current sprint number using three fallbacks in order:
       1. Highest active sprint from the Jira API.
-      2. Sprint number in cell C2 of the worksheet (manually maintained).
+      2. Sprint number in cell B2 of the worksheet (manually maintained).
       3. Highest closed sprint from the Jira API.
     """
     active, closed = [], []
@@ -331,9 +352,9 @@ def _determine_current_sprint_num(issues, ws) -> int:
     if active:
         return max(active)
     try:
-        c2 = int(ws.cell(row=2, column=3).value)
-        if c2 >= MIN_SPRINT:
-            return c2
+        b2 = int(ws.cell(row=2, column=2).value)
+        if b2 >= MIN_SPRINT:
+            return b2
     except (TypeError, ValueError):
         pass
     if closed:
@@ -380,9 +401,14 @@ def get_sprint_history(issue, current_sprint_num):
     return sorted(sprint_entries.items(), key=lambda x: x[0])  # [(sprint_num, scope), ...]
 
 
-def get_status(issue) -> str:
-    status       = issue["fields"]["status"]
-    status_name  = status["name"].lower()
+def get_status(issue, issue_type) -> str:
+    status      = issue["fields"]["status"]
+    status_name = status["name"]
+
+    if issue_type in BUG_DIALIN_TYPES:
+        return BUG_STATUS_MAP.get(status_name, status_name)
+
+    status_name  = status_name.lower()
     category_key = status["statusCategory"]["key"]
 
     if "blocked" in status_name:
@@ -456,15 +482,14 @@ def _ensure_status_validation(ws) -> None:
     All other rows            →  Selection!$E$2:$E$7  (default, also covers future empty rows)
     Must be called AFTER all data rows have been written so column E reflects current types.
     """
-    _BUG_DIALIN = {"Bug", "Dialin ticket"}
-    _L_RANGE    = "Selection!$L$2:$L$13"
-    _E_RANGE    = "Selection!$E$2:$E$7"
+    _L_RANGE = "Selection!$L$2:$L$13"
+    _E_RANGE = "Selection!$E$2:$E$7"
 
     # Classify each written data row: True = Bug/Dialin, False = everything else
     row_types = []
     for row_idx in range(DATA_START_ROW, ws.max_row + 1):
         e_val = ws.cell(row=row_idx, column=5).value
-        row_types.append((row_idx, e_val in _BUG_DIALIN))
+        row_types.append((row_idx, e_val in BUG_DIALIN_TYPES))
 
     # Build (start_row, end_row, is_bug_dialin) groups of consecutive same-type rows
     groups = []
@@ -584,7 +609,7 @@ def _write_issue_row(ws, row_idx, row_record):
     ticket_label = f"[{key}] {fields.get('summary', '')}"
     desc_text       = _adf_to_text(fields.get("description") or "")
     has_description = "Y" if len(desc_text) > 20 else "N"
-    status = get_status(issue)
+    status = get_status(issue, issue_type)
 
     # Column order: A          B     C                  D                E           F      G              H             I
     values = [sprint_num, team, original_assignee, current_assignee, issue_type, scope, has_description, ticket_label, status]
@@ -792,11 +817,11 @@ def _restore_row(ws, row_idx, snapshot):
 
 def _sort_sprint_blocks(ws, current_sprint_num) -> None:
     """
-    Within each contiguous block of rows sharing the same sprint number (current sprint
-    and later only), reorder rows by the Original Assignee's team — FW, then SWVV, then
-    SW, then assignees not in any TEAMS list — and alphabetically by nickname within
-    each group. Rows already marked "Move out of Sprint" (column F) are frozen in place:
-    excluded from the reorder and from the set of positions other rows are written into.
+    Within the contiguous block of rows for the current sprint only, reorder rows by
+    the Original Assignee's team — FW, then SWVV, then SW, then assignees not in any
+    TEAMS list — and alphabetically by nickname within each group. Rows already marked
+    "Move out of Sprint" (column F) are frozen in place: excluded from the reorder and
+    from the set of positions other rows are written into.
     """
     # Find contiguous blocks of rows sharing the same sprint number in column A.
     blocks = []  # (start_row, end_row, sprint_num)
@@ -825,7 +850,7 @@ def _sort_sprint_blocks(ws, current_sprint_num) -> None:
         return (team_idx, nickname or "")
 
     for start_row, end_row, sprint_num in blocks:
-        if sprint_num < current_sprint_num:
+        if sprint_num != current_sprint_num:
             continue
 
         sortable_positions = []
@@ -868,7 +893,8 @@ def update_excel(input_path, issues):
     _ensure_selection_sprints(wb)
     _ensure_data_validations(ws)
 
-    # Determine the boundary sprint. Rows for sprints before this are never touched.
+    # Determine the managed sprint. Rows for any other sprint (past or future) are
+    # never touched.
     current_sprint_num = _determine_current_sprint_num(issues, ws)
 
     # Build sprint_map: sprint_num → sprint_obj (for startDate/state checks in REMOVE).
@@ -879,7 +905,7 @@ def update_excel(input_path, issues):
             if num >= MIN_SPRINT and num not in sprint_map:
                 sprint_map[num] = s
 
-    # Build api_map for current sprint and beyond only.
+    # Build api_map for the current sprint only.
     # "Move out of Sprint" entries are excluded: the Remove operation handles those
     # by marking existing spreadsheet rows rather than inserting new changelog rows.
     # Tickets whose ORIGINAL assignee belongs to SYS_TEAM are excluded entirely — recorded
@@ -888,7 +914,7 @@ def update_excel(input_path, issues):
     sys_excluded = set()
     for issue in issues:
         for sprint_num, scope in get_sprint_history(issue, current_sprint_num):
-            if sprint_num < current_sprint_num or scope == "Move out of Sprint":
+            if sprint_num != current_sprint_num or scope == "Move out of Sprint":
                 continue
             composite = (issue["key"], sprint_num)
             sprint_obj = next(
@@ -910,8 +936,8 @@ def update_excel(input_path, issues):
                 "team":              team_name,
             }
 
-    # Build existing map for current sprint and beyond only.
-    # Past sprint rows (sprint < current_sprint_num) are completely skipped.
+    # Build existing map for the current sprint only.
+    # Rows for any other sprint (past or future) are completely skipped/frozen.
     existing = {}  # composite → [row_idx, ...]
     for row_idx in range(DATA_START_ROW, ws.max_row + 1):
         label      = ws.cell(row=row_idx, column=8).value
@@ -921,7 +947,7 @@ def update_excel(input_path, issues):
             sprint_num = int(sprint_val) if sprint_val is not None else None
         except (ValueError, TypeError):
             sprint_num = None
-        if key and sprint_num is not None and sprint_num >= current_sprint_num:
+        if key and sprint_num is not None and sprint_num == current_sprint_num:
             existing.setdefault((key, sprint_num), []).append(row_idx)
 
     # ── UPDATE ────────────────────────────────────────────────────────────────
@@ -974,18 +1000,12 @@ def update_excel(input_path, issues):
 
     # ── ADD ───────────────────────────────────────────────────────────────────
     # Tickets in the API with no row in the spreadsheet yet: insert at the bottom
-    # of their sprint's section. Sprints are processed in reverse order so that
-    # insertions at later sprints do not shift the insert points for earlier ones.
+    # of the current sprint's section.
     new_composites = [c for c in api_map if c not in existing]
-    new_by_sprint: dict = {}
-    for composite in new_composites:
-        new_by_sprint.setdefault(composite[1], []).append(composite)
-
-    for sprint_num in sorted(new_by_sprint.keys(), reverse=True):
-        insert_after = _insert_point_for_sprint(ws, sprint_num)
-        n = len(new_by_sprint[sprint_num])
-        ws.insert_rows(insert_after + 1, n)
-        for j, composite in enumerate(new_by_sprint[sprint_num]):
+    if new_composites:
+        insert_after = _insert_point_for_sprint(ws, current_sprint_num)
+        ws.insert_rows(insert_after + 1, len(new_composites))
+        for j, composite in enumerate(new_composites):
             _write_issue_row(ws, insert_after + 1 + j, api_map[composite])
 
     # Remove trailing rows with no ticket data.
