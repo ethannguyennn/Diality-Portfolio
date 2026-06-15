@@ -1,45 +1,43 @@
-
 function main(workbook: ExcelScript.Workbook): void {
 
     // ══════════════════════════════════════════════════════════════
-    //  CONFIG — update DATA_SHEET if the tab name differs
+    //  CONFIG
     // ══════════════════════════════════════════════════════════════
     const DATA_SHEET = "Sprint Template";
+    const TOC_SHEET = "Velocity";          // ← NEW
 
-    // 0-based column indices  (A=0  B=1  C=2 … H=7)
-    const C_SPRINT = 0; // A — Sprint #
-    const C_ASSIGNEE = 3; // D — Current Assignee  (C = Original, ignored)
-    const C_TYPE = 4; // E — Process Type
-    const C_SCOPE = 5; // F — Scope Changes
-    const C_STATUS = 8; // I — Ticket Status
+    const C_SPRINT = 0;
+    const C_ASSIGNEE = 3;
+    const C_TYPE = 4;
+    const C_SCOPE = 5;
+    const C_STATUS = 8;
 
-    // Exact string values from the reference sheet
     const STATUSES = ["Blocked", "Done", "In-progress", "Not started", "On-hold", "N/A"];
     const TYPES = ["Big-V", "Little-V", "Bug", "Dialin ticket", "Support"];
     const SCOPES = ["Scoped", "Added", "Move out of Sprint"];
 
     const STATUS_COLORS: { [s: string]: string } = {
-        "Done":        "#4FB06D",
-        "Blocked":     "#BF2C34",
+        "Done": "#4FB06D",
+        "Blocked": "#BF2C34",
         "In-progress": "#F5c26B",
         "Not started": "#CBD6E2",
-        "On-hold":     "#F07857"
+        "On-hold": "#F07857"
     };
     const SCOPE_COLORS: { [s: string]: string } = {
-        "Scoped":             "#4FB06D",
-        "Added":              "#F07857",
+        "Scoped": "#4FB06D",
+        "Added": "#F07857",
         "Move out of Sprint": "#BF2C34"
     };
     const TYPE_COLORS: { [s: string]: string } = {
-        "Big-V":         "#CBD6E2",
-        "Little-V":      "#BE398D",
-        "Bug":           "#BF2C34",
+        "Big-V": "#CBD6E2",
+        "Little-V": "#BE398D",
+        "Bug": "#BF2C34",
         "Dialin ticket": "#F07857",
-        "Support":       "#4FB06D"
+        "Support": "#4FB06D"
     };
 
-    const ROW_PT = 15;  // approx Excel row height in points (used for chart placement)
-    const COL_PT = 72;  // approx Excel column width in points
+    const ROW_PT = 15;
+    const COL_PT = 72;
 
     // ══════════════════════════════════════════════════════════════
     //  LOAD & FILTER DATA
@@ -47,7 +45,6 @@ function main(workbook: ExcelScript.Workbook): void {
     const dataSheet = workbook.getWorksheet(DATA_SHEET);
     if (!dataSheet) throw new Error(`Sheet "${DATA_SHEET}" not found.`);
 
-    // B2 holds the sprint number currently being managed
     const sprint = Number(dataSheet.getRange("B2").getValue());
     if (isNaN(sprint)) throw new Error("B2 does not contain a valid sprint number.");
 
@@ -55,8 +52,6 @@ function main(workbook: ExcelScript.Workbook): void {
     const numRows = used.getRowCount();
     const numCols = Math.max(9, used.getColumnCount());
 
-    // Sheet layout: Row 1 = title area | Row 2 = metadata (B2 = sprint#)
-    //               Row 3 = column headers | Row 4+ = data  →  start at index 3
     const rawData = dataSheet
         .getRangeByIndexes(3, 0, numRows - 3, numCols)
         .getValues();
@@ -65,14 +60,13 @@ function main(workbook: ExcelScript.Workbook): void {
     if (!rows.length) throw new Error(`No rows found for Sprint ${sprint}.`);
 
     function normalizeStatus(raw: string): string {
-    return STATUSES.includes(raw) ? raw : "In-progress";
-}
+        return STATUSES.includes(raw) ? raw : "In-progress";
+    }
 
     // ══════════════════════════════════════════════════════════════
     //  AGGREGATE
     // ══════════════════════════════════════════════════════════════
 
-    // 1 ─ Status by Assignee
     const aMap: { [name: string]: { [status: string]: number } } = {};
     rows.forEach(row => {
         const name = String(row[C_ASSIGNEE]).trim() || "Unassigned";
@@ -82,7 +76,6 @@ function main(workbook: ExcelScript.Workbook): void {
     });
     const people = Object.keys(aMap).sort();
 
-    // 2 ─ Count by Process Type  (skip zero-count entries so pie has no empty slices)
     const typeMap: { [k: string]: number } = {};
     TYPES.forEach(t => (typeMap[t] = 0));
     rows.forEach(row => {
@@ -95,7 +88,6 @@ function main(workbook: ExcelScript.Workbook): void {
         .filter(t => (typeMap[t] || 0) > 0)
         .map(t => [t, typeMap[t]] as [string, number]);
 
-    // 3 ─ Scope Changes
     const scopeMap: { [k: string]: number } = {};
     SCOPES.forEach(s => (scopeMap[s] = 0));
     rows.forEach(row => {
@@ -108,24 +100,22 @@ function main(workbook: ExcelScript.Workbook): void {
         .filter(s => (scopeMap[s] || 0) > 0)
         .map(s => [s, scopeMap[s]] as [string, number]);
 
-    // 4 ─ Count by Status
     const statusMap: { [k: string]: number } = {};
     STATUSES.forEach(s => (statusMap[s] = 0));
     rows.forEach(row => {
-    const s = normalizeStatus(String(row[C_STATUS]).trim());
-    if (statusMap[s] !== undefined) statusMap[s]++;
-      });
+        const s = normalizeStatus(String(row[C_STATUS]).trim());
+        if (statusMap[s] !== undefined) statusMap[s]++;
+    });
     const statusRows = STATUSES.map(s => [s, statusMap[s]] as [string, number]);
 
     // ══════════════════════════════════════════════════════════════
-    //  BUILD VELOCITY SHEET  (deleted & recreated each run)
+    //  BUILD VELOCITY SHEET
     // ══════════════════════════════════════════════════════════════
     const sheetName = `Sprint ${sprint} Velocity`;
     const existing = workbook.getWorksheet(sheetName);
     if (existing) existing.delete();
     const vel = workbook.addWorksheet(sheetName);
 
-    // ─── helpers ─────────────────────────────────────────────────
     function sectionTitle(row: number, text: string): void {
         const c = vel.getRangeByIndexes(row, 0, 1, 1);
         c.setValue(text);
@@ -148,20 +138,14 @@ function main(workbook: ExcelScript.Workbook): void {
             .setValues(vals as (string | number | boolean)[][]);
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  SECTION 1 — Status by Assignee
-    //  Table: Assignee | Blocked | Done | In-progress | Not started | On-hold | N/A | Total
-    //  Chart: Stacked horizontal bar (to the right of the table)
-    // ─────────────────────────────────────────────────────────────
+    // ─── Section 1: Status by Assignee ───────────────────────────
     let r = 0;
-
     sectionTitle(r++, `Sprint ${sprint}  |  Status by Assignee`);
 
     const s1Heads = ["Assignee", ...STATUSES, "Total"];
     tableHeader(r, s1Heads, "#2F5496");
     const s1HRow = r++;
 
-    // Color each status column header individually
     STATUSES.forEach((s, i) => {
         const color = STATUS_COLORS[s];
         if (color) {
@@ -171,7 +155,6 @@ function main(workbook: ExcelScript.Workbook): void {
         }
     });
 
-    // Build body rows:  [name, blocked, done, in-progress, not started, on-hold, N/A, total]
     const s1Body: (string | number)[][] = people.map(p => {
         const cnts = STATUSES.map(s => aMap[p][s] || 0);
         return [p, ...cnts, cnts.reduce((a, b) => a + b, 0)];
@@ -179,9 +162,8 @@ function main(workbook: ExcelScript.Workbook): void {
     tableData(r, s1Body);
     r += s1Body.length;
 
-    // Grand-total row at the bottom
     const colTotals = STATUSES.map((_s, i) =>
-        s1Body.reduce((sum, bodyRow) => sum + (bodyRow[i + 1] as number), 0)
+        s1Body.reduce((sum, row) => sum + (row[i + 1] as number), 0)
     );
     const grandTotal = colTotals.reduce((a, b) => a + b, 0);
     const gRow = vel.getRangeByIndexes(r, 0, 1, s1Heads.length);
@@ -190,33 +172,21 @@ function main(workbook: ExcelScript.Workbook): void {
     gRow.getFormat().getFill().setColor("#BDD7EE");
     r++;
 
-    // Stacked bar chart — excludes the "Total" column, placed to the right of the table
     const s1CRange = vel.getRangeByIndexes(s1HRow, 0, people.length + 1, STATUSES.length + 1);
-    const s1Chart = vel.addChart(
-        ExcelScript.ChartType.barStacked,
-        s1CRange,
-        ExcelScript.ChartSeriesBy.columns
-    );
+    const s1Chart = vel.addChart(ExcelScript.ChartType.barStacked, s1CRange, ExcelScript.ChartSeriesBy.columns);
     s1Chart.getTitle().setText(`Sprint ${sprint} — Status by Assignee`);
     s1Chart.setTop(s1HRow * ROW_PT);
     s1Chart.setLeft(s1Heads.length * COL_PT + 15);
     s1Chart.setWidth(580);
     s1Chart.setHeight(Math.max(300, people.length * 22 + 80));
-
-    // Apply status colors to each chart series
-    // @ts-ignore — ExcelScript types unavailable in local TS environment
+    // @ts-ignore
     s1Chart.getSeries().forEach(series => {
         const color = STATUS_COLORS[series.getName()];
         if (color) series.getFormat().getFill().setSolidColor(color);
     });
+    r += 2;
 
-    r += 2; // gap
-
-    // ─────────────────────────────────────────────────────────────
-    //  SECTION 2 — Count by Process Type
-    //  Table: Process Type | Count
-    //  Chart: Pie (to the right of the table)
-    // ─────────────────────────────────────────────────────────────
+    // ─── Section 2: Count by Process Type ────────────────────────
     const s2Top = r;
     sectionTitle(r++, "Count by Process Type");
     tableHeader(r, ["Process Type", "Count"], "#375623");
@@ -235,23 +205,16 @@ function main(workbook: ExcelScript.Workbook): void {
         s2Chart.getDataLabels().setShowPercentage(true);
         s2Chart.getDataLabels().setShowValue(false);
         s2Chart.getDataLabels().setShowCategoryName(true);
-
-        // Color each pie slice by process type name
-        // @ts-ignore — ExcelScript types unavailable in local TS environment
+        // @ts-ignore
         const s2Slices = s2Chart.getSeries()[0].getPoints();
         typeRows.forEach(([name], i) => {
             const color = TYPE_COLORS[name];
             if (color) s2Slices[i].getFormat().getFill().setSolidColor(color);
         });
     }
-
     r += 2;
 
-    // ─────────────────────────────────────────────────────────────
-    //  SECTION 3 — Scope Changes
-    //  Table: Scope Change | Count
-    //  Chart: Pie (to the right of the table)
-    // ─────────────────────────────────────────────────────────────
+    // ─── Section 3: Scope Changes ─────────────────────────────────
     const s3Top = r;
     sectionTitle(r++, "Scope Changes");
     tableHeader(r, ["Scope Change", "Count"], "#C55A11");
@@ -270,23 +233,16 @@ function main(workbook: ExcelScript.Workbook): void {
         s3Chart.getDataLabels().setShowPercentage(true);
         s3Chart.getDataLabels().setShowValue(false);
         s3Chart.getDataLabels().setShowCategoryName(true);
-
-        // Color each pie slice by scope name
-        // @ts-ignore — ExcelScript types unavailable in local TS environment
+        // @ts-ignore
         const s3Slices = s3Chart.getSeries()[0].getPoints();
         scopeRows.forEach(([name], i) => {
             const color = SCOPE_COLORS[name];
             if (color) s3Slices[i].getFormat().getFill().setSolidColor(color);
         });
     }
-
     r += 2;
 
-    // ─────────────────────────────────────────────────────────────
-    //  SECTION 4 — Count by Status
-    //  Table: Status | Count
-    //  Chart: Pie
-    // ─────────────────────────────────────────────────────────────
+    // ─── Section 4: Count by Status ──────────────────────────────
     const s4Top = r;
     sectionTitle(r++, "Count by Status");
     tableHeader(r, ["Status", "Count"], "#7030A0");
@@ -295,11 +251,7 @@ function main(workbook: ExcelScript.Workbook): void {
     r += statusRows.length;
 
     const s4CRange = vel.getRangeByIndexes(s4HRow, 0, statusRows.length + 1, 2);
-    const s4Chart = vel.addChart(
-        ExcelScript.ChartType.pie,
-        s4CRange,
-        ExcelScript.ChartSeriesBy.columns
-    );
+    const s4Chart = vel.addChart(ExcelScript.ChartType.pie, s4CRange, ExcelScript.ChartSeriesBy.columns);
     s4Chart.getTitle().setText(`Sprint ${sprint} — Ticket Status`);
     s4Chart.setTop(s4Top * ROW_PT);
     s4Chart.setLeft(3 * COL_PT + 15);
@@ -308,17 +260,106 @@ function main(workbook: ExcelScript.Workbook): void {
     s4Chart.getDataLabels().setShowPercentage(true);
     s4Chart.getDataLabels().setShowValue(false);
     s4Chart.getDataLabels().setShowCategoryName(true);
-
-    // Color each pie slice using STATUS_COLORS
-    // @ts-ignore — ExcelScript types unavailable in local TS environment
+    // @ts-ignore
     const s4Slices = s4Chart.getSeries()[0].getPoints();
     statusRows.forEach(([name], i) => {
         const color = STATUS_COLORS[name];
         if (color) s4Slices[i].getFormat().getFill().setSolidColor(color);
     });
 
-    // ─────────────────────────────────────────────────────────────
-    //  AUTOFIT COLUMNS
-    // ─────────────────────────────────────────────────────────────
+    // ─── Autofit ──────────────────────────────────────────────────
     vel.getUsedRange().getFormat().autofitColumns();
+
+    // ══════════════════════════════════════════════════════════════
+    //  HIDE VELOCITY SHEET IMMEDIATELY  ← NEW
+    //  Must come after all content is written — hiding first would
+    //  not cause errors but this order is safer and more explicit.
+    // ══════════════════════════════════════════════════════════════
+    vel.setVisibility(ExcelScript.SheetVisibility.hidden);
+
+    // ══════════════════════════════════════════════════════════════
+    //  UPDATE TOC  ← NEW
+    // ══════════════════════════════════════════════════════════════
+    updateTOC(workbook, sprint, sheetName, TOC_SHEET);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  updateTOC
+//  Writes or refreshes one row in the Velocity TOC for this sprint.
+//  • First run ever: initializes title + column headers
+//  • Same sprint re-run: updates the date, refreshes hyperlink
+//  • New sprint: appends a new row at the bottom
+// ════════════════════════════════════════════════════════════════════
+function updateTOC(
+    workbook: ExcelScript.Workbook,
+    sprint: number,
+    sheetName: string,
+    tocName: string
+): void {
+
+    const toc = workbook.getWorksheet(tocName);
+    if (!toc) {
+        console.log(`Warning: TOC sheet "${tocName}" not found — skipping TOC update.`);
+        return;
+    }
+
+    // M/D/YYYY  e.g.  6/15/2026
+    const today = new Date();
+    const dateStr = `${today.getMonth() + 1}/${today.getDate()}/${today.getFullYear()}`;
+
+    // ── One-time setup: write title + headers if A1 is empty ────
+    const a1Val = String(toc.getRange("A1").getValue()).trim();
+    if (a1Val === "") {
+        const title = toc.getRange("A1");
+        title.setValue("Sprint Velocity Log");
+        title.getFormat().getFont().setBold(true);
+        title.getFormat().getFont().setSize(16);
+        title.getFormat().getFont().setColor("#1F3864");
+
+        const hdr = toc.getRange("A2:B2");
+        hdr.setValues([["Sprint", "Date Generated"]]);
+        hdr.getFormat().getFill().setColor("#2F5496");
+        hdr.getFormat().getFont().setBold(true);
+        hdr.getFormat().getFont().setColor("#FFFFFF");
+    }
+
+    // ── Batch-read column A rows 3–202 to find existing entry ───
+    //    (one API call instead of looping per cell)
+    const scanValues = toc.getRangeByIndexes(2, 0, 200, 1).getValues();
+    const displayName = `Sprint ${sprint}`;   // e.g. "Sprint 5"
+
+    let foundRow = -1;
+    let nextEmptyRow = 2;   // 0-indexed; row index 2 = sheet row 3
+
+    for (let i = 0; i < scanValues.length; i++) {
+        const cellVal = String(scanValues[i][0]).trim();
+        if (cellVal === "") {
+            nextEmptyRow = 2 + i;
+            break;
+        }
+        if (cellVal === displayName) {
+            foundRow = 2 + i;
+        }
+        nextEmptyRow = 2 + i + 1;
+    }
+
+    const writeRow = foundRow >= 0 ? foundRow : nextEmptyRow;
+
+    // ── Sprint name cell with clickable hyperlink ────────────────
+    const nameCell = toc.getRangeByIndexes(writeRow, 0, 1, 1);
+    nameCell.setValue(displayName);
+    nameCell.setHyperlink({
+        address: "",
+        documentReference: `'${sheetName}'!A1`,   // e.g. 'Sprint 5 Velocity'!A1
+        screenTip: `Open ${sheetName}`,
+        textToDisplay: displayName
+    });
+    nameCell.getFormat().getFont().setColor("#0563C1");
+    nameCell.getFormat().getFont().setUnderline(ExcelScript.RangeUnderlineStyle.single);
+
+    // ── Date cell ────────────────────────────────────────────────
+    toc.getRangeByIndexes(writeRow, 1, 1, 1).setValue(dateStr);
+
+    // ── Autofit ──────────────────────────────────────────────────
+    toc.getUsedRange().getFormat().autofitColumns();
 }
