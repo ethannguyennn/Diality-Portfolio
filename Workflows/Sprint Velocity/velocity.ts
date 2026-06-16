@@ -281,6 +281,147 @@ function main(workbook: ExcelScript.Workbook): void {
     //  UPDATE TOC  ← NEW
     // ══════════════════════════════════════════════════════════════
     updateTOC(workbook, sprint, sheetName, TOC_SHEET);
+    updateVelocityChart(workbook, rawData, TOC_SHEET);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  updateVelocityChart
+//  Writes a "Committed vs Done with Completion %" combo chart to the
+//  Velocity TOC sheet.  Data table starts at E2; chart is placed
+//  directly below it.  Rebuilds from scratch on every run.
+// ════════════════════════════════════════════════════════════════════
+function updateVelocityChart(
+    workbook: ExcelScript.Workbook,
+    rawData: (string | number | boolean)[][],
+    tocName: string
+): void {
+    const C_SPRINT = 0;
+    const C_SCOPE  = 5;
+    const C_STATUS = 8;
+    const CHART_TITLE = "Sprint Committed vs Done with Completion %";
+
+    const toc = workbook.getWorksheet(tocName);
+    if (!toc) return;
+
+    // ── Aggregate committed / done counts by sprint ───────────────
+    const sprintData: { [num: number]: { committed: number; done: number } } = {};
+    for (const row of rawData) {
+        const sprintNum = Number(row[C_SPRINT]);
+        if (!sprintNum || isNaN(sprintNum)) continue;
+        const scope  = String(row[C_SCOPE]).trim();
+        const status = String(row[C_STATUS]).trim();
+        if (scope === "Move out of Sprint") continue;
+        if (!sprintData[sprintNum]) sprintData[sprintNum] = { committed: 0, done: 0 };
+        sprintData[sprintNum].committed++;
+        if (status === "Done") sprintData[sprintNum].done++;
+    }
+
+    const sortedSprints = Object.keys(sprintData)
+        .map(k => Number(k))
+        .sort((a, b) => a - b)
+        .slice(-10);
+
+    if (sortedSprints.length === 0) return;
+
+    // ── Remove any existing chart with this title ─────────────────
+    // @ts-ignore
+    toc.getCharts().forEach(c => {
+        try { if (c.getTitle().getText() === CHART_TITLE) c.delete(); }
+        catch (_e) { /* chart has no title */ }
+    });
+
+    // ── Clear old data table area: E2 down 12 rows (header + 10 + buffer) ──
+    toc.getRangeByIndexes(1, 4, 12, 4).clear(ExcelScript.ClearApplyTo.all);
+
+    // ── Write header row at E2 (row index 1, col index 4) ────────
+    const hdr = toc.getRangeByIndexes(1, 4, 1, 4);
+    hdr.setValues([["Sprint", "Committed", "Done", "Completion %"]]);
+    hdr.getFormat().getFill().setColor("#2F5496");
+    hdr.getFormat().getFont().setBold(true);
+    hdr.getFormat().getFont().setColor("#FFFFFF");
+
+    // ── Write data rows ───────────────────────────────────────────
+    // Sprint stored as string so Excel treats it as a category axis, not a series.
+    const tableRows: (string | number)[][] = sortedSprints.map(s => {
+        const d = sprintData[s];
+        const pct = d.committed > 0 ? d.done / d.committed : 0;
+        return [String(s), d.committed, d.done, pct];
+    });
+    toc.getRangeByIndexes(2, 4, tableRows.length, 4)
+        .setValues(tableRows as (string | number | boolean)[][]);
+
+    // Format Completion % column (H) as percentage
+    toc.getRangeByIndexes(2, 7, tableRows.length, 1).setNumberFormatLocal("0%");
+
+    // Autofit E–H columns to their content
+    toc.getRangeByIndexes(1, 4, tableRows.length + 1, 4).getFormat().autofitColumns();
+
+    // ── Create chart anchored below the data table ────────────────
+    // Chart range is F–H only (Committed, Done, Completion %) so the
+    // Sprint column (E) cannot be misread as a data series by Excel.
+    // Sprint numbers are wired in as category labels via setXAxisValues.
+    const seriesDataRange  = toc.getRangeByIndexes(1, 5, tableRows.length + 1, 3);
+    const sprintLabelRange = toc.getRangeByIndexes(2, 4, tableRows.length, 1);
+    const anchorCell       = toc.getRangeByIndexes(2 + tableRows.length + 1, 4, 1, 1);
+
+    const chart = toc.addChart(
+        ExcelScript.ChartType.columnClustered,
+        seriesDataRange,
+        ExcelScript.ChartSeriesBy.columns
+    );
+    chart.getTitle().setText(CHART_TITLE);
+    chart.setTop(anchorCell.getTop());
+    chart.setLeft(anchorCell.getLeft());
+    chart.setWidth(500);
+    chart.setHeight(300);
+
+    // ── Configure series ──────────────────────────────────────────
+    // With Sprint excluded, series are: [0]=Committed, [1]=Done, [2]=Completion %
+    // @ts-ignore
+    const allSeries: ExcelScript.ChartSeries[] = chart.getSeries();
+
+    // Bind sprint numbers as the x-axis category labels for every series
+    allSeries[0].setXAxisValues(sprintLabelRange);
+    allSeries[1].setXAxisValues(sprintLabelRange);
+    allSeries[2].setXAxisValues(sprintLabelRange);
+
+    const seriesCommitted = allSeries[0];
+    const seriesDone      = allSeries[1];
+    const seriesPct       = allSeries[2];
+
+    seriesCommitted.getFormat().getFill().setSolidColor("#4472C4"); // blue bars
+    seriesDone.getFormat().getFill().setSolidColor("#ED7D31");      // orange bars
+
+    // Convert Completion % to a line with circle markers on the secondary axis
+    seriesPct.setChartType(ExcelScript.ChartType.lineMarkers);
+    // @ts-ignore
+    seriesPct.setAxisGroup(ExcelScript.ChartAxisGroup.secondary);
+    seriesPct.getFormat().getLine().setColor("#70AD47");            // green line
+    seriesPct.setMarkerStyle(ExcelScript.ChartMarkerStyle.circle);
+
+    // ── Data labels ───────────────────────────────────────────────
+    seriesCommitted.getDataLabels().setShowValue(true);
+    seriesDone.getDataLabels().setShowValue(true);
+    seriesPct.getDataLabels().setShowValue(true);
+    seriesPct.getDataLabels().setNumberFormat("0%");
+
+    // ── Y-axis titles and formats ─────────────────────────────────
+    const primaryAxis = chart.getAxes().getValueAxis();
+    primaryAxis.getTitle().setText("Work Items");
+    primaryAxis.getTitle().setVisible(true);
+    primaryAxis.setNumberFormat("0");   // whole numbers, not percentages
+    primaryAxis.setMinimum(0);
+
+    // Secondary axis: getItem(value, secondary) is the correct ExcelScript API.
+    try {
+        // @ts-ignore
+        const secAxis: ExcelScript.ChartAxis = chart.getAxes().getItem(ExcelScript.ChartAxisType.value, ExcelScript.ChartAxisGroup.secondary);
+        secAxis.getTitle().setText("Completion %");
+        secAxis.getTitle().setVisible(true);
+        secAxis.setNumberFormat("0%");
+        secAxis.setMaximum(1);
+        secAxis.setMinimum(0);
+    } catch (_e) { /* secondary axis not yet available at script time */ }
 }
 
 // ════════════════════════════════════════════════════════════════════
