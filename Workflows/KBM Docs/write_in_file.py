@@ -1,149 +1,153 @@
-from __future__ import annotations
-
-import argparse
 import json
+import os
 import re
-import sys
-from pathlib import Path
 
-# Matches the version suffix in a filename, e.g. " v.17.0"
-VERSION_PATTERN = re.compile(r"\s+v\.(\d+)\.(\d+)", re.IGNORECASE)
+import openpyxl
 
-# Matches a DIA identifier in a filename, e.g. "DIA EF-732L.1"
-DIA_ID_PATTERN = re.compile(r"\bDIA\s+([A-Z]{2}-[A-Z0-9]+(?:\.\d+)?)")
-
-def get_dia_id(filename: str) -> str | None:
-    """Returns the DIA identifier found in the filename, or None."""
-    match = DIA_ID_PATTERN.search(filename)
-    return f"DIA {match.group(1)}" if match else None
+# ── Configuration ─────────────────────────────────────────────────────────────
+RECORDS_FOLDER = r'c:\Scripts\KBM\Records\testset'
+JSON_PATH      = r'c:\Scripts\KBM\kbmmap.json'
+EXCEL_PATH     = r'c:\Scripts\KBM\whitney testing.xlsx'
+# ──────────────────────────────────────────────────────────────────────────────
 
 
-def get_version(filename: str) -> str | None:
-    """Returns the version string (e.g. '17.0') found in the filename, or None."""
-    match = None
-    for m in VERSION_PATTERN.finditer(filename):
-        match = m  # keep the last match in case the pattern appears more than once
-
-    if match is None:
-        return None
-    return f"{match.group(1)}.{match.group(2)}"
-
-
-def get_version_tuple(filename: str) -> tuple[str, tuple[int, int]] | None:
-    """
-    Returns (group_key, (major, minor)) for version-comparison purposes,
-    where group_key is the filename text before the version suffix.
-    Used to identify which files are superseded by a newer version.
-    """
-    match = None
-    for m in VERSION_PATTERN.finditer(filename):
-        match = m
-
-    if match is None:
-        return None
-
-    group_key = filename[:match.start()].strip().lower()
-    version   = (int(match.group(1)), int(match.group(2)))
-    return group_key, version
-
-def split_current_and_outdated(files: list[Path]) -> tuple[list[Path], list[Path]]:
-    """
-    Separates files into (current, outdated).
-    A file is outdated if another file in the list shares the same
-    DIA identifier + title but has a higher version number.
-    """
-    parsed = {f: get_version_tuple(f.name) for f in files}
-
-    # Find the highest version seen for each group key
-    latest: dict[str, tuple[int, int]] = {}
-    for info in parsed.values():
-        if info is None:
-            continue
-        key, version = info
-        if key not in latest or version > latest[key]:
-            latest[key] = version
-
-    current:  list[Path] = []
-    outdated: list[Path] = []
-    for f in files:
-        info = parsed[f]
-        if info is not None and info[1] < latest[info[0]]:
-            outdated.append(f)
-        else:
-            current.append(f)
-
-    return current, outdated
-
-def load_propel_map() -> dict[str, str]:
-    """Loads DIA identifier -> Propel # from kbmmap.json (next to this script)."""
-    path = Path(__file__).resolve().parent / "kbmmap.json"
-    if not path.exists():
-        return {}
-    with open(path, encoding="utf-8") as f:
+def load_json(path):
+    with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
-def run(folder: Path) -> None:
-    # Collect and filter .url files
-    all_files = sorted(folder.glob("*.url"))
-    if not all_files:
-        print(f"[!] No .url files found in: {folder.resolve()}")
-        sys.exit(1)
 
-    current_files, outdated_files = split_current_and_outdated(all_files)
+def normalize(s):
+    return s.replace('_', ' ')
 
-    if outdated_files:
-        print(f"[i] Skipping {len(outdated_files)} outdated file(s):")
-        for f in outdated_files:
-            print(f"    - {f.name}")
-        print()
 
-    if not current_files:
-        print(f"[!] No current .url files found in: {folder.resolve()}")
-        sys.exit(1)
+def extract_dia_code(filename):
+    """Extract DIA identifier from a filename (e.g. 'DIA WF-736J', 'DIA EF-732L.1').
+    Handles underscore variants and prefixes like 'Watermarked_'.
+    Requires whitespace after 'DIA' to avoid matching 'KH25120-DIA01' style strings."""
+    normalized = normalize(filename)
+    match = re.search(r'\bDIA\s+([A-Z0-9][A-Z0-9\-\.]*[A-Z0-9]|[A-Z]+)', normalized)
+    if match:
+        return f"DIA {match.group(1)}"
+    return None
 
-    print(f"Found {len(current_files)} .url file(s) in '{folder}'\n")
 
-    propel_map = load_propel_map()
+def get_id_from_json(data, dia_code):
+    """Return the 6/9-digit identifier string for a DIA code.
+    Handles both the original plain-string format and the extended dict format."""
+    entry = data.get(dia_code)
+    if entry is None:
+        return None
+    if isinstance(entry, str):
+        return entry
+    return entry.get('id')
 
-    # Column width for the DIA Identifier column
-    dia_ids  = [get_dia_id(f.name) for f in current_files]
-    col_width = max((len(d) for d in dia_ids if d), default=0)
-    col_width = max(col_width, len("DIA Identifier")) + 2
 
-    # Header
-    print(f"{'DIA Identifier':<{col_width}}  {'Version':<12}  {'Date':<16}  {'Propel #':<12}  Notes")
-    print("-" * (col_width + 50))
+def version_score(filename):
+    """Return a sortable tuple for the version in a filename. Higher = newer.
+    Handles v.X.Y, vX.Y, and bare vX (e.g. v.13.0, v.16, v1.1)."""
+    m = re.search(r'\bv\.?(\d+)(?:\.(\d+))?', filename, re.IGNORECASE)
+    if m:
+        major = int(m.group(1))
+        minor = int(m.group(2)) if m.group(2) else 0
+        return (major, minor)
+    return (0, 0)
 
-    # Rows
-    for f, dia_id in zip(current_files, dia_ids):
-        version = get_version(f.name)
-        propel  = propel_map.get(dia_id) if dia_id else None
-        notes   = "Could not extract DIA identifier from filename." if dia_id is None else ""
 
-        print(
-            f"{dia_id or '—':<{col_width}}  "
-            f"{version or '—':<12}  "
-            f"{'—':<16}  "
-            f"{propel or '—':<12}  "
-            f"{notes}"
-        )
+def collect_files(folder):
+    """Walk folder recursively and return (pdf_files, docx_files) as lists of absolute paths."""
+    pdf_files  = []
+    docx_files = []
+    for root, _, files in os.walk(folder):
+        for name in files:
+            lower = name.lower()
+            full  = os.path.abspath(os.path.join(root, name))
+            if lower.endswith('.pdf'):
+                pdf_files.append(full)
+            elif lower.endswith('.docx'):
+                docx_files.append(full)
+    return pdf_files, docx_files
 
-    print(f"\nProcessed {len(current_files)} file(s), skipped {len(outdated_files)} outdated file(s).")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Extract DIA Identifier, Version, and Propel # from KeborMed .url shortcuts."
-    )
-    parser.add_argument(
-        "--folder",
-        default="Records",
-        help="Folder containing .url shortcuts (default: 'Records')",
-    )
-    args = parser.parse_args()
+def build_docx_index(docx_files):
+    """Build a lookup from a leading ID prefix -> list of docx paths.
+    The prefix is the leading 6-digit number (optionally followed by -NNN or -NNNN)
+    as it appears in the filename."""
+    index = {}
+    pattern = re.compile(r'^(\d{6}(?:-\d{3,4})?)\b')
+    for path in docx_files:
+        name = os.path.basename(path)
+        m = pattern.match(name)
+        if m:
+            prefix = m.group(1)
+            index.setdefault(prefix, []).append(path)
+    return index
 
-    folder = Path(args.folder)
-    if not folder.exists() or not folder.is_dir():
-        print(f"[!] Not a valid folder: {folder.resolve()}")
-        sys.exit(1)
 
-    run(folder)
+def create_workbook():
+    """Always create a fresh workbook with headers, overwriting any existing file."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(['Index', 'PDF Path', 'DOCX Path'])
+    # 870 px → (870 - 5) / 7 ≈ 123.6 character units
+    ws.column_dimensions['B'].width = 123.6
+    ws.column_dimensions['C'].width = 123.6
+    return wb, ws
+
+
+def main():
+    data       = load_json(JSON_PATH)
+    pdf_files, docx_files = collect_files(RECORDS_FOLDER)
+    docx_index = build_docx_index(docx_files)
+    wb, ws     = create_workbook()
+    start_row  = 2
+    index      = 1
+
+    no_dia  = 0
+    no_json = 0
+
+    # Group PDFs by DIA code, keeping only the highest-versioned file per code
+    best_pdf = {}  # {dia_code -> (version_tuple, absolute_path)}
+    for pdf_path in pdf_files:
+        name     = os.path.basename(pdf_path)
+        dia_code = extract_dia_code(name)
+        if dia_code is None:
+            no_dia += 1
+            continue
+        score = version_score(name)
+        if dia_code not in best_pdf or score > best_pdf[dia_code][0]:
+            best_pdf[dia_code] = (score, pdf_path)
+
+    no_docx = 0
+    matched = 0
+
+    for dia_code, (score, pdf_path) in sorted(best_pdf.items()):
+        doc_id = get_id_from_json(data, dia_code)
+        if doc_id is None:
+            no_json += 1
+            print(f'  [no JSON match]  {os.path.basename(pdf_path)}  →  {dia_code}')
+            continue
+
+        candidates = docx_index.get(doc_id, [])
+        docx_path  = candidates[0] if candidates else None
+
+        if docx_path is None:
+            no_docx += 1
+
+        ws.cell(row=start_row, column=1, value=index)
+        ws.cell(row=start_row, column=2, value=pdf_path)
+        ws.cell(row=start_row, column=3, value=docx_path if docx_path else '')
+
+        index     += 1
+        start_row += 1
+        matched   += 1
+
+    wb.save(EXCEL_PATH)
+
+    print(f'\nDone. Wrote {matched} rows to {EXCEL_PATH}')
+    print(f'  PDFs without DIA identifier:  {no_dia}')
+    print(f'  DIA codes not in JSON:        {no_json}')
+    print(f'  DIA codes with no DOCX match: {no_docx}')
+
+
+if __name__ == '__main__':
+    main()
