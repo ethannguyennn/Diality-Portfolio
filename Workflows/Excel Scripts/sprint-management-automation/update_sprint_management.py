@@ -772,7 +772,7 @@ def update_excel(input_path, issues):
 
     _, orig_table_xml = _capture_table_xml(input_path)
 
-    wb = load_workbook(input_path)
+    wb = load_workbook(input_path, keep_vba=input_path.lower().endswith('.xlsm'))
 
     if SHEET_NAME not in wb.sheetnames:
         raise ValueError(
@@ -813,7 +813,9 @@ def update_excel(input_path, issues):
                 None
             )
             original_assignee = _original_assignee_for_sprint(issue, sprint_obj)
-            team_name, team_idx = _team_for_nickname(original_assignee)
+            current_full_name = issue["fields"]["assignee"]["displayName"] if issue["fields"].get("assignee") else ""
+            current_assignee  = _assignee_nickname(current_full_name)
+            team_name, team_idx = _team_for_nickname(current_assignee)
             if team_idx == _SYS_TEAM_IDX:
                 sys_excluded.add(composite)
                 continue
@@ -925,7 +927,7 @@ def _is_file_locked(path: str) -> bool:
 
 
 def _sync_hplus(source_path: str, dest_path: str) -> None:
-    wb_src = load_workbook(source_path, data_only=True)
+    wb_src = load_workbook(source_path, data_only=True, keep_vba=source_path.lower().endswith('.xlsm'))
     ws_src = wb_src[SHEET_NAME]
     hplus_map = {}
     for row_idx in range(DATA_START_ROW, ws_src.max_row + 1):
@@ -941,7 +943,7 @@ def _sync_hplus(source_path: str, dest_path: str) -> None:
 
     _, dest_table_xml = _capture_table_xml(dest_path)
 
-    wb_dst = load_workbook(dest_path)
+    wb_dst = load_workbook(dest_path, keep_vba=dest_path.lower().endswith('.xlsm'))
     ws_dst = wb_dst[SHEET_NAME]
     for row_idx in range(DATA_START_ROW, ws_dst.max_row + 1):
         key = _extract_key(ws_dst.cell(row=row_idx, column=8).value)
