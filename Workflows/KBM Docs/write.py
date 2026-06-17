@@ -1,13 +1,15 @@
 import json
 import os
 import re
+import shutil
 
 import openpyxl
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-RECORDS_FOLDER = r'c:\Scripts\KBM\Records\testset'
-JSON_PATH      = r'c:\Scripts\KBM\kbmmap.json'
-EXCEL_PATH     = r'c:\Scripts\KBM\whitney testing.xlsx'
+RECORDS_FOLDER  = r'c:\Scripts\KBM\Records\testset'
+OUTDATED_FOLDER = os.path.join(RECORDS_FOLDER, 'outdated')
+JSON_PATH       = r'c:\Scripts\KBM\kbmmap.json'
+EXCEL_PATH      = r'c:\Scripts\KBM\whitney testing.xlsx'
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -21,9 +23,7 @@ def normalize(s):
 
 
 def extract_dia_code(filename):
-    """Extract DIA identifier from a filename (e.g. 'DIA WF-736J', 'DIA EF-732L.1').
-    Handles underscore variants and prefixes like 'Watermarked_'.
-    Requires whitespace after 'DIA' to avoid matching 'KH25120-DIA01' style strings."""
+    # Extract DIA identifier from a filename 
     normalized = normalize(filename)
     match = re.search(r'\bDIA\s+([A-Z0-9][A-Z0-9\-\.]*[A-Z0-9]|[A-Z]+)', normalized)
     if match:
@@ -32,8 +32,6 @@ def extract_dia_code(filename):
 
 
 def get_id_from_json(data, dia_code):
-    """Return the 6/9-digit identifier string for a DIA code.
-    Handles both the original plain-string format and the extended dict format."""
     entry = data.get(dia_code)
     if entry is None:
         return None
@@ -43,8 +41,7 @@ def get_id_from_json(data, dia_code):
 
 
 def version_score(filename):
-    """Return a sortable tuple for the version in a filename. Higher = newer.
-    Handles v.X.Y, vX.Y, and bare vX (e.g. v.13.0, v.16, v1.1)."""
+    # Return a sortable tuple for the version in a filename. 
     m = re.search(r'\bv\.?(\d+)(?:\.(\d+))?', filename, re.IGNORECASE)
     if m:
         major = int(m.group(1))
@@ -54,10 +51,11 @@ def version_score(filename):
 
 
 def collect_files(folder):
-    """Walk folder recursively and return (pdf_files, docx_files) as lists of absolute paths."""
     pdf_files  = []
     docx_files = []
-    for root, _, files in os.walk(folder):
+    skip = {'outdated', 'redline'}
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d.lower() not in skip]
         for name in files:
             lower = name.lower()
             full  = os.path.abspath(os.path.join(root, name))
@@ -69,9 +67,7 @@ def collect_files(folder):
 
 
 def build_docx_index(docx_files):
-    """Build a lookup from a leading ID prefix -> list of docx paths.
-    The prefix is the leading 6-digit number (optionally followed by -NNN or -NNNN)
-    as it appears in the filename."""
+    #Build a lookup from a leading ID prefix -> list of docx paths.
     index = {}
     pattern = re.compile(r'^(\d{6}(?:-\d{3,4})?)\b')
     for path in docx_files:
@@ -84,19 +80,39 @@ def build_docx_index(docx_files):
 
 
 def create_workbook():
-    """Always create a fresh workbook with headers, overwriting any existing file."""
+    # Always create a fresh workbook with headers, overwriting any existing file.
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.append(['Index', 'PDF Path', 'DOCX Path'])
-    # 870 px → (870 - 5) / 7 ≈ 123.6 character units
-    ws.column_dimensions['B'].width = 123.6
-    ws.column_dimensions['C'].width = 123.6
+    ws.column_dimensions['B'].width = 124
+    ws.column_dimensions['C'].width = 124
     return wb, ws
+
+
+
+def move_outdated_pdfs(all_pdfs_by_dia, best_pdf):
+    # Move every non-best PDF version into OUTDATED_FOLDER, preserving subfolder structure.
+    moved = 0
+    os.makedirs(OUTDATED_FOLDER, exist_ok=True)
+    for dia_code, entries in all_pdfs_by_dia.items():
+        if len(entries) <= 1:
+            continue
+        best_path = best_pdf[dia_code][1]
+        for _, pdf_path in entries:
+            if pdf_path == best_path:
+                continue
+            dest = os.path.join(OUTDATED_FOLDER, os.path.basename(pdf_path))
+            shutil.move(pdf_path, dest)
+            print(f'  [outdated] moved: {os.path.basename(pdf_path)}')
+            moved += 1
+    return moved
 
 
 def main():
     data       = load_json(JSON_PATH)
     pdf_files, docx_files = collect_files(RECORDS_FOLDER)
+
+    docx_files = [p for p in docx_files if not re.search(r'red', os.path.basename(p), re.IGNORECASE)]
     docx_index = build_docx_index(docx_files)
     wb, ws     = create_workbook()
     start_row  = 2
@@ -105,8 +121,8 @@ def main():
     no_dia  = 0
     no_json = 0
 
-    # Group PDFs by DIA code, keeping only the highest-versioned file per code
-    best_pdf = {}  # {dia_code -> (version_tuple, absolute_path)}
+    # Group all PDFs by DIA code
+    all_pdfs_by_dia = {}  # {dia_code -> [(version_tuple, absolute_path), ...]}
     for pdf_path in pdf_files:
         name     = os.path.basename(pdf_path)
         dia_code = extract_dia_code(name)
@@ -114,11 +130,20 @@ def main():
             no_dia += 1
             continue
         score = version_score(name)
-        if dia_code not in best_pdf or score > best_pdf[dia_code][0]:
-            best_pdf[dia_code] = (score, pdf_path)
+        all_pdfs_by_dia.setdefault(dia_code, []).append((score, pdf_path))
 
-    no_docx = 0
-    matched = 0
+    # Best version per DIA code
+    best_pdf = {
+        dia_code: max(entries, key=lambda x: x[0])
+        for dia_code, entries in all_pdfs_by_dia.items()
+    }
+
+    # Move outdated versions
+    moved_count = move_outdated_pdfs(all_pdfs_by_dia, best_pdf)
+
+    no_docx        = 0
+    matched        = 0
+    missing_doc_ids = []
 
     for dia_code, (score, pdf_path) in sorted(best_pdf.items()):
         doc_id = get_id_from_json(data, dia_code)
@@ -132,6 +157,7 @@ def main():
 
         if docx_path is None:
             no_docx += 1
+            missing_doc_ids.append(doc_id)
 
         ws.cell(row=start_row, column=1, value=index)
         ws.cell(row=start_row, column=2, value=pdf_path)
@@ -144,9 +170,15 @@ def main():
     wb.save(EXCEL_PATH)
 
     print(f'\nDone. Wrote {matched} rows to {EXCEL_PATH}')
-    print(f'  PDFs without DIA identifier:  {no_dia}')
-    print(f'  DIA codes not in JSON:        {no_json}')
-    print(f'  DIA codes with no DOCX match: {no_docx}')
+    print(f'  Outdated PDFs moved to outdated/: {moved_count}')
+    print(f'  PDFs without DIA identifier:       {no_dia}')
+    print(f'  DIA codes not in JSON:             {no_json}')
+    print(f'  DIA codes with no DOCX match:      {no_docx}')
+
+    if missing_doc_ids:
+        print('\nDOCX files needed (add to folder):')
+        for doc_id in missing_doc_ids:
+            print(f'  {doc_id}')
 
 
 if __name__ == '__main__':
