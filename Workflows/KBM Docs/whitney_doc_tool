@@ -58,114 +58,264 @@ docPathNew = ""
 
 #################### END VARIABLES ####################
 
-#################### MAIN ####################
-sheetToRead = sys.argv[1]
+def extract_revision_from_filename(filename):
+	# Extract revision identifier (letter or number) from filename
+	match = re.search(r'Rev\s?([A-Z0-9]+)', filename, re.IGNORECASE)
+	return match.group(1) if match else ""
 
-docDF = pd.read_excel(sheetToRead)
+def revision_sort_key(rev_str):
+	"""Create a sort key that handles both letter and numeric revisions"""
+	if rev_str.isalpha():
+		return (0, rev_str)  # Letters come first
+	else:
+		try:
+			return (1, int(rev_str))  # Then numbers
+		except ValueError:
+			return (2, rev_str)  # Fallback to string sort
+
+def find_top_two_revisions(docx_path):
+	#Find the two latest versions of a document by recursively searching the parent directory and subdirectories
+	docx_dir = os.path.dirname(docx_path)
+	docx_basename = os.path.basename(docx_path)
+	parent_dir = os.path.dirname(docx_dir)
+
+	# Extract item number from filename (10XXXX pattern)
+	item_match = re.search(r"10\d{4}", docx_basename)
+	if not item_match:
+		return None, None
+
+	item_no = item_match.group(0)
+
+	# Recursively find all DOCX files in parent directory and subdirectories with the same item number
+	matching_files = []
+	for root, _, files in os.walk(parent_dir):
+		for fname in files:
+			if fname.lower().endswith('.docx') and item_no in fname and 'red' not in fname.lower():
+				full_path = os.path.join(root, fname)
+				rev = extract_revision_from_filename(fname)
+				matching_files.append((rev, full_path, fname))
+
+	if len(matching_files) < 2:
+		return None, None
+
+	# Sort by revision (highest first)
+	matching_files.sort(key=lambda x: revision_sort_key(x[0]))
+
+	# Return the last two (highest revisions): old_doc, new_doc
+	return matching_files[-2][1], matching_files[-1][1]
+
+def get_user_menu_choice(prompt, options):
+	print(f"\n{prompt}")
+	for i, option in enumerate(options, 1):
+		print(f"[{i}] {option}")
+	while True:
+		try:
+			choice = int(input("\nEnter your choice: ").strip())
+			if 1 <= choice <= len(options):
+				return choice
+			print(f"Please enter a number between 1 and {len(options)}")
+		except ValueError:
+			print("Invalid input. Please enter a number.")
+
+def select_documents(pdf_paths):
+	print("\nAvailable PDFs:")
+	for i, pdf_path in enumerate(pdf_paths, 1):
+		basename = os.path.basename(pdf_path)
+		print(f"[{i}] {basename}")
+
+	while True:
+		try:
+			user_input = input("\nEnter PDF numbers to process (comma-separated, e.g., 1,3,5): ").strip()
+			indices = [int(x.strip()) - 1 for x in user_input.split(',')]
+			if all(0 <= idx < len(pdf_paths) for idx in indices):
+				return indices
+			print(f"Please enter valid numbers between 1 and {len(pdf_paths)}")
+		except ValueError:
+			print("Invalid input. Please enter numbers separated by commas (e.g., 1,2,3)")
+
 def remove_empty_pages(doc):
-    # 1. Remove trailing empty paragraphs
-    while doc.paragraphs and not doc.paragraphs[-1].text.strip():
-        p = doc.paragraphs[-1]._element
-        p.getparent().remove(p)
-        doc.paragraphs.pop()
+	# 1. Remove trailing empty paragraphs
+	while doc.paragraphs and not doc.paragraphs[-1].text.strip():
+		p = doc.paragraphs[-1]._element
+		p.getparent().remove(p)
+		doc.paragraphs.pop()
 
 def find_date(firstPageStr):
-    date_pattern = re.compile(
-        r'\b(\d{1,2}/\d{1,2}/\d{4}|(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})\b',
-        re.IGNORECASE
-    )
-    dates = date_pattern.findall(firstPageStr)
+	date_pattern = re.compile(
+		r'\b(\d{1,2}/\d{1,2}/\d{4}|(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})\b',
+		re.IGNORECASE
+	)
+	dates = date_pattern.findall(firstPageStr)
 
-    return re.sub(r'\s+', ' ', dates[0][0]).strip() 
+	return re.sub(r'\s+', ' ', dates[0][0]).strip()
 
 def read_word_document(pdf_path, docx_path):
-    pdfReader = PdfReader(pdf_path)
+	pdfReader = PdfReader(pdf_path)
 
-    # create a document object
-    doc = Document(docx_path)
+	# create a document object
+	doc = Document(docx_path)
 
-    # create a page object for the first page of the PDF
-    page = pdfReader.pages[0]
+	# create a page object for the first page of the PDF
+	page = pdfReader.pages[0]
 
-    ### END program variables ###
+	### END program variables ###
 
-    ### MAIN ###
-    ## Read the PDF Document ##
-    # extracting text from first page
-    firstPageStr = page.extract_text()
+	### MAIN ###
+	## Read the PDF Document ##
+	# extracting text from first page
+	firstPageStr = page.extract_text()
 
-    # find the revision of the document
-    versionPos = firstPageStr.find("Version:") if firstPageStr.find("Version:") > -1 else firstPageStr.find("Version")
-    versionStr = firstPageStr[(versionPos + __lenVersionStr):(versionPos + __lenEndVersionStr)].strip()
-    dateStr     = find_date(firstPageStr)
+	# find the revision of the document
+	versionPos = firstPageStr.find("Version:") if firstPageStr.find("Version:") > -1 else firstPageStr.find("Version")
+	versionStr = firstPageStr[(versionPos + __lenVersionStr):(versionPos + __lenEndVersionStr)].strip()
+	dateStr     = find_date(firstPageStr)
 
-    print(f"{docx_path}|{versionStr}|{dateStr}")
-    return doc, versionStr, dateStr
+	print(f"{docx_path}|{versionStr}|{dateStr}")
+	return doc, versionStr, dateStr
 
-for pdf, docPathInitial in zip(docDF["PDF Path"].values, docDF["DOCX Path"].values):
-    doc, versionStr, dateStr = read_word_document(pdf, docPathInitial)
+def process_documents(docDF, mode, doc_indices=None):
+	# Process documents based on selected mode and scope.
+	global revisionStr, revisionInt, docPathNew
 
-    ## END Read the PDF Document ##
+	# Determine which rows to process
+	if doc_indices is None:
+		rows_to_process = range(len(docDF))
+	else:
+		rows_to_process = doc_indices
 
-    ## Update the Word Doc ##
-    # revision_update_utility.py function to update the revision in the header table
-    revisionInt = headerRevUpdate(doc, revisionStr, revisionInt)
+	# Get PDF and DOCX paths
+	pdf_paths = docDF["PDF Path"].values
+	docx_paths = docDF["DOCX Path"].values
 
-    # Update the revision and effective date of the referenced document
-    for para in doc.paragraphs:
-        if "DIA" in para.text:
-            textToUpdate = para.text
+	for row_idx in rows_to_process:
+		pdf = pdf_paths[row_idx]
+		docPathInitial = docx_paths[row_idx]
 
-    textToUpdate = re.sub(regexRevisionPattern, versionStr, str(textToUpdate))
-    textToUpdate = re.sub(regexDatePattern, dateStr, str(textToUpdate))
+		print(f"\n{'='*60}")
+		print(f"Processing row {row_idx + 1}: {os.path.basename(docPathInitial)}")
+		print(f"{'='*60}")
 
-    for para in doc.paragraphs:
-        if "DIA" in para.text:
-            para.text = textToUpdate
+		# Mode 3: Create only redline (compare two existing versions)
+		if mode == 3:
+			oldDocPath, newDocPath = find_top_two_revisions(docPathInitial)
+			if oldDocPath is None or newDocPath is None:
+				print(f"  [SKIPPED] Document has fewer than 2 versions. Cannot create redline.")
+				continue
 
-    # Update the revision history table
-    # revision_update_utility.py function to update the revision history table at the EOF
+			print(f"  Comparing: {os.path.basename(oldDocPath)}")
+			print(f"        vs:  {os.path.basename(newDocPath)}")
+			createWordComparison(oldDocPath, newDocPath)
+			time.sleep(2)
 
-    revHistoryUpdate(doc, revisionInt, strRevCommentary, strVersion)
-    remove_empty_pages(doc)
+			# Move redline to original DOCX directory if it was created in a different directory
+			redline_path = oldDocPath[:(len(oldDocPath) - 5)] + "_REDLINE.docx"
+			original_dir = os.path.dirname(docPathInitial)
+			if os.path.exists(redline_path):
+				redline_filename = os.path.basename(redline_path)
+				dest_redline_path = os.path.join(original_dir, redline_filename)
+				if os.path.dirname(redline_path) != original_dir:
+					shutil.move(redline_path, dest_redline_path)
+					print(f"  Moved redline to original location: {redline_filename}")
+				else:
+					print(f"  Created redline: {redline_filename}")
 
-              
-    # revision_update_utility.py function to update the revision number in the document path name
+			continue  # Skip file organization for mode 3
 
-    docPathNew = docPathRevUpdate(doc, docPathInitial, revisionInt, docPathNew)
+		# Mode 1 & 2: Create new revision (and possibly redline)
+		doc, versionStr, dateStr = read_word_document(pdf, docPathInitial)
 
-   
+		## Update the Word Doc ##
+		# revision_update_utility.py function to update the revision in the header table
+		revisionInt = headerRevUpdate(doc, revisionStr, revisionInt)
 
-    # revision_update_utility.py function to compare two word documents and create a redline
+		# Update the revision and effective date of the referenced document
+		for para in doc.paragraphs:
+			if "DIA" in para.text:
+				textToUpdate = para.text
 
-    createWordComparison(docPathInitial, docPathNew)
-    time.sleep(2)
+		textToUpdate = re.sub(regexRevisionPattern, versionStr, str(textToUpdate))
+		textToUpdate = re.sub(regexDatePattern, dateStr, str(textToUpdate))
 
-    ## Organize output files into a named folder ##
-    docx_dir = os.path.dirname(docPathInitial)
-    docx_filename = os.path.splitext(os.path.basename(docPathInitial))[0]
+		for para in doc.paragraphs:
+			if "DIA" in para.text:
+				para.text = textToUpdate
 
-    item_match = re.search(r"10\d{4}", docx_filename)
-    text_after = docx_filename[item_match.end():] if item_match else docx_filename
-    text_after = re.sub(r"^[,\s]+", "", text_after)
-    text_after = re.sub(r",?\s*Rev\s?[A-Z0-9]+", "", text_after).strip().rstrip(",").strip()
+		# Update the revision history table
+		revHistoryUpdate(doc, revisionInt, strRevCommentary, strVersion)
+		remove_empty_pages(doc)
 
-    dia_match = re.search(r"DIA\s+[A-Z]+-\d+[A-Z]?\.\d+", os.path.basename(pdf))
-    dia_id = dia_match.group(0) if dia_match else ""
+		# revision_update_utility.py function to update the revision number in the document path name
+		docPathNew = docPathRevUpdate(doc, docPathInitial, revisionInt, docPathNew)
 
-    dest_folder = os.path.join(docx_dir, f"{text_after} ({dia_id})")
-    os.makedirs(dest_folder, exist_ok=True)
+		# Create redline only if mode is 1
+		if mode == 1:
+			createWordComparison(docPathInitial, docPathNew)
+			time.sleep(2)
+		else:  # mode == 2
+			print(f"  [SKIPPED REDLINE] As requested for 'Create only new rev' mode")
 
-    if os.path.exists(docPathInitial) and not re.search(r'red', os.path.basename(docPathInitial), re.IGNORECASE):
-        shutil.move(docPathInitial, os.path.join(dest_folder, os.path.basename(docPathInitial)))
-    if os.path.exists(docPathNew) and not re.search(r'red', os.path.basename(docPathNew), re.IGNORECASE):
-        shutil.move(docPathNew, os.path.join(dest_folder, os.path.basename(docPathNew)))
-    if os.path.exists(pdf):
-        shutil.move(pdf, os.path.join(dest_folder, os.path.basename(pdf)))
+		## Organize output files into a named folder ##
+		docx_dir = os.path.dirname(docPathInitial)
+		docx_filename = os.path.splitext(os.path.basename(docPathInitial))[0]
 
-    print(f"Organized: {text_after} ({dia_id})")
+		item_match = re.search(r"10\d{4}", docx_filename)
+		text_after = docx_filename[item_match.end():] if item_match else docx_filename
+		text_after = re.sub(r"^[,\s]+", "", text_after)
+		text_after = re.sub(r",?\s*Rev\s?[A-Z0-9]+", "", text_after).strip().rstrip(",").strip()
 
-## END Update the Word Doc ##
+		dia_match = re.search(r"DIA\s+[A-Z]+-\d+[A-Z]?\.\d+", os.path.basename(pdf))
+		dia_id = dia_match.group(0) if dia_match else ""
+
+		dest_folder = os.path.join(docx_dir, f"{text_after} ({dia_id})")
+		os.makedirs(dest_folder, exist_ok=True)
+
+		if os.path.exists(docPathInitial) and not re.search(r'red', os.path.basename(docPathInitial), re.IGNORECASE):
+			shutil.move(docPathInitial, os.path.join(dest_folder, os.path.basename(docPathInitial)))
+		if os.path.exists(docPathNew) and not re.search(r'red', os.path.basename(docPathNew), re.IGNORECASE):
+			shutil.move(docPathNew, os.path.join(dest_folder, os.path.basename(docPathNew)))
+		if os.path.exists(pdf):
+			shutil.move(pdf, os.path.join(dest_folder, os.path.basename(pdf)))
+
+		print(f"  Organized: {text_after} ({dia_id})")
+
+def main():
+	if len(sys.argv) < 2:
+		print("Usage: python whitney_doc_tool.py <excel_filename>")
+		sys.exit(1)
+
+	sheetToRead = sys.argv[1]
+	docDF = pd.read_excel(sheetToRead)
+
+	# First menu: Choose operation mode
+	mode = get_user_menu_choice(
+		"Select the operation to perform:",
+		[
+			"Create new rev and redline",
+			"Create only new rev",
+			"Create only new redline"
+		]
+	)
+
+	# Second menu: Choose scope
+	scope = get_user_menu_choice(
+		"Select scope:",
+		[
+			"Affect all documents",
+			"Select docs"
+		]
+	)
+
+	doc_indices = None
+	if scope == 2:
+		pdf_list = docDF["PDF Path"].values.tolist()
+		doc_indices = select_documents(pdf_list)
+
+	# Process documents
+	process_documents(docDF, mode, doc_indices)
+
+	print(f"\n{'='*60}")
+	print("All operations completed!")
+	print(f"{'='*60}")
 
 if __name__ == "__main__":
-    print("meow")
+	main()
