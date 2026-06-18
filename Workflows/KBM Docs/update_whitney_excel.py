@@ -2,14 +2,15 @@ import json
 import os
 import re
 import shutil
+import sys
 
 import openpyxl
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-RECORDS_FOLDER  = r'c:\Scripts\KBM\Records\testset'
+_SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
+RECORDS_FOLDER  = os.path.join(_SCRIPT_DIR, 'KBM Docs')
 OUTDATED_FOLDER = os.path.join(RECORDS_FOLDER, 'outdated')
-JSON_PATH       = r'c:\Scripts\KBM\kbmmap.json'
-EXCEL_PATH      = r'c:\Scripts\KBM\whitney testing.xlsx'
+JSON_PATH       = os.path.join(_SCRIPT_DIR, 'kbm_map.json')
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -31,13 +32,16 @@ def extract_dia_code(filename):
     return None
 
 
-def get_id_from_json(data, dia_code):
+def get_id_from_json(data, dia_code, normalized_filename=None):
     entry = data.get(dia_code)
-    if entry is None:
-        return None
-    if isinstance(entry, str):
-        return entry
-    return entry.get('id')
+    if entry is not None:
+        return entry if isinstance(entry, str) else entry.get('id')
+    # Fallback: check if any JSON key is a substring of the full filename
+    if normalized_filename:
+        for key, value in data.items():
+            if key in normalized_filename:
+                return value if isinstance(value, str) else value.get('id')
+    return None
 
 
 def version_score(filename):
@@ -90,14 +94,14 @@ def create_workbook():
 
 
 
-def move_outdated_pdfs(all_pdfs_by_dia, best_pdf):
+def move_outdated_pdfs(all_pdfs_by_id, best_pdf):
     # Move every non-best PDF version into OUTDATED_FOLDER, preserving subfolder structure.
     moved = 0
     os.makedirs(OUTDATED_FOLDER, exist_ok=True)
-    for dia_code, entries in all_pdfs_by_dia.items():
+    for doc_id, entries in all_pdfs_by_id.items():
         if len(entries) <= 1:
             continue
-        best_path = best_pdf[dia_code][1]
+        best_path = best_pdf[doc_id][1]
         for _, pdf_path in entries:
             if pdf_path == best_path:
                 continue
@@ -109,6 +113,14 @@ def move_outdated_pdfs(all_pdfs_by_dia, best_pdf):
 
 
 def main():
+    
+    if len(sys.argv) < 2:
+        print('Usage: python update_whitney_excel.py <excel_filename>')
+        print('Example: python update_whitney_excel.py "whitney testing.xlsx"')
+        sys.exit(1)
+    excel_arg  = sys.argv[1]
+    EXCEL_PATH = excel_arg if os.path.isabs(excel_arg) else os.path.join(_SCRIPT_DIR, excel_arg)
+
     data       = load_json(JSON_PATH)
     pdf_files, docx_files = collect_files(RECORDS_FOLDER)
 
@@ -121,37 +133,36 @@ def main():
     no_dia  = 0
     no_json = 0
 
-    # Group all PDFs by DIA code
-    all_pdfs_by_dia = {}  # {dia_code -> [(version_tuple, absolute_path), ...]}
+    # Group all PDFs by resolved doc_id so each unique document gets its own bucket
+    all_pdfs_by_id = {}  # {doc_id -> [(version_tuple, absolute_path), ...]}
     for pdf_path in pdf_files:
         name     = os.path.basename(pdf_path)
         dia_code = extract_dia_code(name)
         if dia_code is None:
             no_dia += 1
             continue
+        doc_id = get_id_from_json(data, dia_code, normalize(name))
+        if doc_id is None:
+            no_json += 1
+            print(f'  [no JSON match]  {name}  →  {dia_code}')
+            continue
         score = version_score(name)
-        all_pdfs_by_dia.setdefault(dia_code, []).append((score, pdf_path))
+        all_pdfs_by_id.setdefault(doc_id, []).append((score, pdf_path))
 
-    # Best version per DIA code
+    # Best version per doc_id
     best_pdf = {
-        dia_code: max(entries, key=lambda x: x[0])
-        for dia_code, entries in all_pdfs_by_dia.items()
+        doc_id: max(entries, key=lambda x: x[0])
+        for doc_id, entries in all_pdfs_by_id.items()
     }
 
     # Move outdated versions
-    moved_count = move_outdated_pdfs(all_pdfs_by_dia, best_pdf)
+    moved_count = move_outdated_pdfs(all_pdfs_by_id, best_pdf)
 
     no_docx        = 0
     matched        = 0
     missing_doc_ids = []
 
-    for dia_code, (score, pdf_path) in sorted(best_pdf.items()):
-        doc_id = get_id_from_json(data, dia_code)
-        if doc_id is None:
-            no_json += 1
-            print(f'  [no JSON match]  {os.path.basename(pdf_path)}  →  {dia_code}')
-            continue
-
+    for doc_id, (score, pdf_path) in sorted(best_pdf.items()):
         candidates = docx_index.get(doc_id, [])
         docx_path  = candidates[0] if candidates else None
 
