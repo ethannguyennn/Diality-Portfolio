@@ -1,5 +1,3 @@
-# Whitney Together - Combined Excel Update and Document Processing Tool
-
 import json
 import os
 import re
@@ -16,10 +14,6 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 import win32com.client
 import win32com.client.gencache
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# REVISION UPDATE UTILITY FUNCTIONS (integrated from revision_update_utility.py)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 alphabet = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J',
             'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T',
@@ -131,8 +125,6 @@ def createWordComparison(oldDocPath, newDocPath):
             return
 
     raise Exception("Max retries exceeded. Comparison function not run.")
-
-# ═══════════════════════════════════════════════════════════════════════════════
 
 #################### MACROS ####################
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
