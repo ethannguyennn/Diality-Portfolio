@@ -274,3 +274,11 @@ class SharePointHelper:
     def clear_token_cache(self) -> None:
         self.token_cache.clear()
         self.access_token = None
+"""
+TO DO:
+- upload file
+- download
+- rename
+- make dir_and_upload
+
+"""
