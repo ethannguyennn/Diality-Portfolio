@@ -6,13 +6,15 @@ updated even while someone has it open in Excel Online.
 
 import os
 import re
-import requests
-from requests.auth import HTTPBasicAuth
-from dotenv import load_dotenv
 from datetime import datetime
+from typing import Optional
 
-from sharepoint_helper import SharePointHelper
+import requests
+from dotenv import load_dotenv
+from requests.auth import HTTPBasicAuth
+
 from config import ARCHIVE_PATH, SPRINT_TEMPLATE_FILE
+from sharepoint_helper import SharePointHelper
 
 load_dotenv()
 
@@ -46,21 +48,36 @@ _SYS_TEAM_IDX = len(TEAMS) - 1
 _UNMATCHED_TEAM_IDX = len(TEAMS)
 
 NICKNAME_MAP = {
-    "Tejaskumar Patel": "Tejas", "Nicholas Ramirez": "Nico",
-    "Thomas Lippold": "Tom", "Jashwant Gantyada": "Jashwant",
-    "Behrouz NematiPour": "Behrouz", "Sean Nash": "Sean",
-    "Vinayakam Mani": "Vinay", "Raghu Kallala": "Raghu",
-    "Tiffany Mejia": "Tiffany", "Zoltan Miskolci": "Zoltan",
-    "Sarina Cheung": "Sarina", "Tisha Patel": "Tisha",
-    "Ethan Nguyen": "Ethan", "Arpita Srivastava": "Arpita",
-    "Michael Garthwaite": "Michael", "Praneeth Bunne": "Praneeth",
-    "Sameer Poyil": "Sameer", "Varshini Nagabooshanam": "Varshini",
-    "Vijay Pamula": "Vijay", "Suresh Dharnala": "Suresh",
-    "Dara Navaei": "Dara", "Eliza Petersen": "Eliza",
-    "Stephen Quong": "Stephen", "Christina Heine": "Christina",
-    "Caitlynn Chang": "Caitlynn", "Santhos Kumar Reddy": "Santhos",
-    "Abhijit Barman": "Abhijit", "Chris Yu": "Chris",
-    "Vitas Buenaventura": "Vitas", "Emiline Hernandez": "Emiline",
+    "Tejaskumar Patel": "Tejas", 
+    "Nicholas Ramirez": "Nico",
+    "Thomas Lippold": "Tom", 
+    "Jashwant Gantyada": "Jashwant",
+    "Behrouz NematiPour": "Behrouz", 
+    "Sean Nash": "Sean",
+    "Vinayakam Mani": "Vinay", 
+    "Raghu Kallala": "Raghu",
+    "Tiffany Mejia": "Tiffany", 
+    "Zoltan Miskolci": "Zoltan",
+    "Sarina Cheung": "Sarina", 
+    "Tisha Patel": "Tisha",
+    "Ethan Nguyen": "Ethan", 
+    "Arpita Srivastava": "Arpita",
+    "Michael Garthwaite": "Michael", 
+    "Praneeth Bunne": "Praneeth",
+    "Sameer Poyil": "Sameer", 
+    "Varshini Nagabooshanam": "Varshini",
+    "Vijay Pamula": "Vijay", 
+    "Suresh Dharnala": "Suresh",
+    "Dara Navaei": "Dara", 
+    "Eliza Petersen": "Eliza",
+    "Stephen Quong": "Stephen", 
+    "Christina Heine": "Christina",
+    "Caitlynn Chang": "Caitlynn", 
+    "Santhos Kumar Reddy": "Santhos",
+    "Abhijit Barman": "Abhijit", 
+    "Chris Yu": "Chris",
+    "Vitas Buenaventura": "Vitas", 
+    "Emiline Hernandez": "Emiline",
 }
 
 _ASSIGNEE_TO_TEAM_IDX: dict = {}
@@ -70,6 +87,7 @@ for _ti, _team in enumerate(TEAMS):
         _nick = NICKNAME_MAP.get(_full)
         if _nick:
             _ASSIGNEE_TO_TEAM_IDX[_nick] = _ti
+del _ti, _team, _full, _nick
 
 # ── Type / status constants ──
 TYPE_FONT_COLORS = {
@@ -164,7 +182,7 @@ def _adf_to_text(node) -> str:
     return "".join(_adf_to_text(c) for c in node.get("content", []))
 
 
-def _latest_jira_note(issue, auth) -> str:
+def _latest_jira_note(issue, auth) -> Optional[str]:
     comment_field = issue["fields"].get("comment") or {}
     comments = list(comment_field.get("comments", []))
     if comment_field.get("total", len(comments)) > len(comments):
@@ -295,7 +313,7 @@ def get_sprint_history(issue, max_sprint_num):
     for name in all_sprint_names:
         if name not in current_sprint_names:
             num = _sprint_num(name)
-            if num >= MIN_SPRINT and num <= max_sprint_num:
+            if MIN_SPRINT <= num <= max_sprint_num:
                 sprint_entries[num] = MOVED_OUT
 
     for name, sprint_obj in current_sprint_objs.items():
@@ -485,7 +503,7 @@ def update_via_workbook(helper, item_id, session_id, issues):
             }
 
     # ── Index existing target-sprint rows from the live grid ──
-    existing = {}  # (key, sprint) -> {row, cells[0..11]}
+    existing = {}  # (key, sprint) -> [{"row": int, "cells": list}, ...]
     for r in range(DATA_START_ROW, last_data_row + 1):
         sn = _norm_sprint(_gv(grid, r, 1))
         key = _extract_key(_gv(grid, r, 8))
@@ -575,49 +593,86 @@ def update_via_workbook(helper, item_id, session_id, issues):
 
     if fin_n == 0:
         print("No active rows for target sprints; nothing to write.")
-        return current_sprint_num
+    else:
+        end_row = region_start + fin_n - 1
 
-    end_row = region_start + fin_n - 1
+        # ── Write all values in one batch ──
+        wb("PATCH", f"{_WS}/range(address='A{region_start}:{_LAST_COL}{end_row}')",
+           {"values": final_rows})
 
-    # ── Write all values in one batch ──
-    wb("PATCH", f"{_WS}/range(address='A{region_start}:{_LAST_COL}{end_row}')",
-       {"values": final_rows})
+        # ── Overwrite col H with HYPERLINK formulas ──
+        formulas = [[_hyperlink_formula(row[7])] for row in final_rows]
+        wb("PATCH", f"{_WS}/range(address='H{region_start}:H{end_row}')",
+           {"formulas": formulas})
 
-    # ── Overwrite col H with HYPERLINK formulas ──
-    formulas = [[_hyperlink_formula(row[7])] for row in final_rows]
-    wb("PATCH", f"{_WS}/range(address='H{region_start}:H{end_row}')",
-       {"formulas": formulas})
+        # ── Formatting: type color on col E (batched by contiguous same-color runs) ──
+        types = [row[4] for row in final_rows]
+        i = 0
+        while i < fin_n:
+            color = TYPE_FONT_COLORS.get(types[i], "000000")
+            j = i
+            while j + 1 < fin_n and TYPE_FONT_COLORS.get(types[j + 1], "000000") == color:
+                j += 1
+            r1, r2 = region_start + i, region_start + j
+            wb("PATCH", f"{_WS}/range(address='E{r1}:E{r2}')/format/font",
+               {"color": f"#{color}"})
+            i = j + 1
 
-    # ── Formatting: type color on col E (batched by contiguous same-color runs) ──
-    types = [row[4] for row in final_rows]
-    i = 0
-    while i < fin_n:
-        color = TYPE_FONT_COLORS.get(types[i], "000000")
-        j = i
-        while j + 1 < fin_n and TYPE_FONT_COLORS.get(types[j + 1], "000000") == color:
-            j += 1
-        r1, r2 = region_start + i, region_start + j
-        wb("PATCH", f"{_WS}/range(address='E{r1}:E{r2}')/format/font",
-           {"color": f"#{color}"})
-        i = j + 1
+        # Col H: blue underlined link style
+        wb("PATCH", f"{_WS}/range(address='H{region_start}:H{end_row}')/format/font",
+           {"color": "#1155CC", "underline": "Single"})
 
-    # Col H: blue underlined link style
-    wb("PATCH", f"{_WS}/range(address='H{region_start}:H{end_row}')/format/font",
-       {"color": "#1155CC", "underline": "Single"})
+        # Alignment on all written cells
+        wb("PATCH", f"{_WS}/range(address='A{region_start}:{_LAST_COL}{end_row}')/format",
+           {"horizontalAlignment": "Left", "verticalAlignment": "Center"})
 
-    # Alignment on all written cells
-    wb("PATCH", f"{_WS}/range(address='A{region_start}:{_LAST_COL}{end_row}')/format",
-       {"horizontalAlignment": "Left", "verticalAlignment": "Center"})
+        print(
+            f"Done via Workbook API "
+            f"(sprints {current_sprint_num}/{next_sprint_num} | "
+            f"{len(api_map)} active, {len(issues)} tickets | "
+            f"{updated} updated, {len(new_composites)} added, "
+            f"{removed} marked-removed, {deleted} deleted | "
+            f"rows {region_start}-{end_row})"
+        )
 
-    print(
-        f"Done via Workbook API "
-        f"(sprints {current_sprint_num}/{next_sprint_num} | "
-        f"{len(api_map)} active, {len(issues)} tickets | "
-        f"{updated} updated, {len(new_composites)} added, "
-        f"{removed} marked-removed, {deleted} deleted | "
-        f"rows {region_start}-{end_row})"
-    )
+    # ── "Last Updated" timestamp in H2 ──
+    now = datetime.now().strftime("%m/%d/%Y %I:%M %p")
+    wb("PATCH", f"{_WS}/range(address='H2')",
+       {"values": [[f"Last Updated: {now}"]]})
+
     return current_sprint_num
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Sprint filter (separate session so the Table range is up-to-date)
+# ═══════════════════════════════════════════════════════════════════
+
+def apply_sprint_filter(helper, item_id, session_id, current_sprint_num):
+    """Filter the Table's first column to show only the current sprint.
+
+    Must run in a separate session AFTER data writes are committed,
+    otherwise the Table range won't include newly inserted rows.
+    """
+    def wb(method, rel, body=None):
+        return helper.workbook_request(method, item_id, session_id, rel, body)
+
+    try:
+        tables_resp = wb("GET", f"{_WS}/tables")
+        table_list = tables_resp.get("value", [])
+        if table_list:
+            table_name = table_list[0]["name"]
+            wb("POST",
+               f"tables('{table_name}')/columns/itemAt(index=0)/filter/apply",
+               {"criteria": {
+                   "criterion1": f"={current_sprint_num}",
+                   "filterOn": "Custom"
+               }})
+            print(f"Table filter applied: showing only Sprint {current_sprint_num}")
+        else:
+            print("Warning: no Excel Table found on sheet; "
+                  "cannot set filter programmatically via Graph API")
+    except Exception as e:
+        print(f"Warning: could not apply filter: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -635,11 +690,19 @@ def main():
     archive_path = helper.archive_file(SPRINT_TEMPLATE_FILE, archive_folder=ARCHIVE_PATH)
     print(f"Archived: {archive_path}")
 
-    print("Updating Sprint Template via Workbook API...")
     item_id = helper.get_item_id(SPRINT_TEMPLATE_FILE)
+
+    print("Updating Sprint Template via Workbook API...")
     session_id = helper.open_workbook_session(item_id)
     try:
-        update_via_workbook(helper, item_id, session_id, issues)
+        current_sprint_num = update_via_workbook(helper, item_id, session_id, issues)
+    finally:
+        helper.close_workbook_session(item_id, session_id)
+
+    print("Applying sprint filter...")
+    session_id = helper.open_workbook_session(item_id)
+    try:
+        apply_sprint_filter(helper, item_id, session_id, current_sprint_num)
     finally:
         helper.close_workbook_session(item_id, session_id)
 
