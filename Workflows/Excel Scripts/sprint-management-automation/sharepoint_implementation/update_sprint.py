@@ -428,12 +428,13 @@ def _issue_row_cells(record):
             current_assignee, issue_type, record["scope"], has_desc, label, status]
 
 
+
 def _hyperlink_formula(label):
     """Build =HYPERLINK(url, label) from a '[KEY] summary' label."""
     key = _extract_key(label)
     if not key:
-        return label
-    lbl = str(label).replace('"', '""')
+        return str(label) if label is not None else ""
+    lbl = str(label).replace('"', '""').replace('\n', ' ').replace('\r', '')
     return f'=HYPERLINK("{BASE_URL}/browse/{key}","{lbl}")'
 
 
@@ -444,9 +445,10 @@ def update_via_workbook(helper, item_id, session_id, issues):
         return helper.workbook_request(method, item_id, session_id, rel, body)
 
     # ── Read the live grid ──
-    used = wb("GET", f"{_WS}/usedRange?$select=values,rowCount")
+    used = wb("GET", f"{_WS}/usedRange?$select=values,rowCount,address")
     grid = used.get("values", [])
     total_rows = used.get("rowCount", len(grid))
+    print(f"[DIAG] usedRange address: {used.get('address')}, rowCount: {total_rows}, grid rows: {len(grid)}")
 
     # Find last row with actual data in A..I
     last_data_row = DATA_START_ROW - 1
@@ -504,9 +506,13 @@ def update_via_workbook(helper, item_id, session_id, issues):
 
     # ── Index existing target-sprint rows from the live grid ──
     existing = {}  # (key, sprint) -> [{"row": int, "cells": list}, ...]
+    print(f"\n[DIAG] === EXISTING GRID ROWS (col H raw values) ===")
     for r in range(DATA_START_ROW, last_data_row + 1):
         sn = _norm_sprint(_gv(grid, r, 1))
-        key = _extract_key(_gv(grid, r, 8))
+        raw_h = _gv(grid, r, 8)
+        key = _extract_key(raw_h)
+        if sn in target_set:
+            print(f"  Excel row {r} | sprint={sn} | key={key} | raw H={repr(raw_h)}")
         if key and sn in target_set:
             cells = [_gv(grid, r, c) for c in range(1, NUM_COLS + 1)]
             existing.setdefault((key, sn), []).append({"row": r, "cells": cells})
@@ -577,6 +583,14 @@ def update_via_workbook(helper, item_id, session_id, issues):
         final_rows.extend(sorted(final[sn], key=_sort_key))
     fin_n = len(final_rows)
 
+    print(f"\n[DIAG] === FINAL ROWS TO WRITE ({fin_n} rows) ===")
+    print(f"  {'Row':>4} | {'Sprint':>6} | {'Team':>4} | {'Assignee':<12} | {'Key':<12} | Col H (label)")
+    print(f"  {'----':>4} | {'------':>6} | {'----':>4} | {'--------':<12} | {'---':<12} | -----")
+    for i, row in enumerate(final_rows):
+        label = row[7]
+        key = _extract_key(label)
+        print(f"  {region_start + i:>4} | {row[0]:>6} | {str(row[1]):>4} | {str(row[3]):<12} | {key or '???':<12} | {repr(label)}")
+
     # ── Reconcile row count: insert or delete rows as needed ──
     delta = fin_n - region_cur_n
     if delta > 0:
@@ -596,14 +610,14 @@ def update_via_workbook(helper, item_id, session_id, issues):
     else:
         end_row = region_start + fin_n - 1
 
-        # ── Write all values in one batch ──
+        # ── Single atomic write: values + HYPERLINK formulas in col H ──
+        formulas_grid = []
+        for row in final_rows:
+            frow = list(row)
+            frow[7] = _hyperlink_formula(row[7])
+            formulas_grid.append(frow)
         wb("PATCH", f"{_WS}/range(address='A{region_start}:{_LAST_COL}{end_row}')",
-           {"values": final_rows})
-
-        # ── Overwrite col H with HYPERLINK formulas ──
-        formulas = [[_hyperlink_formula(row[7])] for row in final_rows]
-        wb("PATCH", f"{_WS}/range(address='H{region_start}:H{end_row}')",
-           {"formulas": formulas})
+           {"formulas": formulas_grid})
 
         # ── Formatting: type color on col E (batched by contiguous same-color runs) ──
         types = [row[4] for row in final_rows]
