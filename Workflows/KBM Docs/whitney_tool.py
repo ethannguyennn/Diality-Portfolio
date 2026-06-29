@@ -30,19 +30,9 @@ from PySide6.QtGui import QFont
 # CONSTANTS
 ###################################################
 
-alphabet = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J',
-            'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T',
-            'U', 'V', 'W', 'X', 'Y', 'Z']
-
 __lenRevisionStr = 13       # len("Revision No: ")
 __maxRetries = 3            # Word COM retry limit
 __delay = 1                 # base seconds between retries
-
-# Patterns for DIA-style item numbers (e.g. "101234-05", "Rev A2")
-regexDocPathRevOnItemNoPattern = r"10\d\d\d\d-\d\d"
-regexDocPathRevWhitespacePattern = r"Rev\s[A-Z0-9]+"
-regexDocPathItemNoPattern = r"10\d\d\d\d"
-regexDocPathRev = r"Rev[A-Z0-9]+"
 
 if getattr(sys, 'frozen', False):
     _SCRIPT_DIR = os.path.dirname(sys.executable)
@@ -135,16 +125,8 @@ __lenEndVersionStr = 14     # how far past "Version:" to read (captures "X.XX")
 # General-purpose patterns (override the DIA-specific ones above for broader matching)
 regexRevisionPattern = '[0-9]+\.[0-9]+'         # matches "1.2", "3.14"
 regexDatePattern = '[0-9]+/[0-9]+/[0-9]+'       # matches "1/2/2024"
-regexDocPathItemNoPattern = r"[0-9]+"
-regexDocPathRevOnItemNoPattern = r"[0-9]+-[0-9]+"
 regexDocPathRevWhitespacePattern = r"[A-Za-z]+\s[0-9]+"
 regexDocPathRev = r"[A-Za-z]+[0-9]+"
-
-# DIA-specific variants (stricter, used for targeted lookups)
-regexDocPathRevOnItemNoPattern_dia = r"10\d\d\d\d-\d\d"
-regexDocPathRevWhitespacePattern_dia = r"Rev\s[A-Z0-9]+"
-regexDocPathItemNoPattern_dia = r"10\d\d\d\d"
-regexDocPathRev_dia = r"Rev[A-Z0-9]+"
 
 strRevCommentary = "External document updated."  # default revision history entry text
 strVersion = ""
@@ -159,7 +141,7 @@ docPathNew = ""
 ####################################################
 
 
-# Read current rev from header, return the next one (A->B or 01->02)
+# Read current rev from header, return the next one (01->02)
 def getRevisionInteger(section, strRev, newRev):
     for table in section.header.tables:
         for row in table.rows:
@@ -167,16 +149,11 @@ def getRevisionInteger(section, strRev, newRev):
                 if "Revision" in cell.text:
                     strRev = cell.text[__lenRevisionStr:]
 
-    if strRev.isalpha():
-        posRev = alphabet.index(strRev)
-        newPosRev = posRev + 1
-        newRev = alphabet[newPosRev]
+    newRev = int(strRev) + 1
+    if newRev < 10:
+        newRev = '0' + str(newRev)
     else:
-        newRev = int(strRev) + 1
-        if newRev < 10:
-            newRev = '0' + str(newRev)
-        else:
-            newRev = str(newRev)
+        newRev = str(newRev)
 
     return newRev
 
@@ -630,13 +607,14 @@ def process_documents(docDF, mode, doc_indices=None, progress_callback=None):
         part_number = item_match.group(0) if item_match else ""
         folder_prefix = f"{part_number}, " if part_number else ""
         dest_folder = os.path.join(docx_dir, f"{folder_prefix}{text_after} ({dia_id})")
-        os.makedirs(dest_folder, exist_ok=True)
 
         if os.path.exists(docPathInitial) and not re.search(r'red', os.path.basename(docPathInitial), re.IGNORECASE):
             shutil.move(docPathInitial, os.path.join(PREV_REV_FOLDER, os.path.basename(docPathInitial)))
         if os.path.exists(docPathNew) and not re.search(r'red', os.path.basename(docPathNew), re.IGNORECASE):
+            os.makedirs(dest_folder, exist_ok=True)
             shutil.move(docPathNew, os.path.join(dest_folder, os.path.basename(docPathNew)))
         if os.path.exists(pdf):
+            os.makedirs(dest_folder, exist_ok=True)
             shutil.move(pdf, os.path.join(dest_folder, os.path.basename(pdf)))
 
         print(f"  Organized: {folder_prefix}{text_after} ({dia_id})")
