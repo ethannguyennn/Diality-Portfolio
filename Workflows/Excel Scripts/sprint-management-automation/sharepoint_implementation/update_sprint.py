@@ -48,38 +48,39 @@ _SYS_TEAM_IDX = len(TEAMS) - 1
 _UNMATCHED_TEAM_IDX = len(TEAMS)
 
 NICKNAME_MAP = {
-    "Tejaskumar Patel": "Tejas", 
+    "Tejaskumar Patel": "Tejas",
     "Nicholas Ramirez": "Nico",
-    "Thomas Lippold": "Tom", 
+    "Thomas Lippold": "Tom",
     "Jashwant Gantyada": "Jashwant",
-    "Behrouz NematiPour": "Behrouz", 
+    "Behrouz NematiPour": "Behrouz",
     "Sean Nash": "Sean",
-    "Vinayakam Mani": "Vinay", 
+    "Vinayakam Mani": "Vinay",
     "Raghu Kallala": "Raghu",
-    "Tiffany Mejia": "Tiffany", 
+    "Tiffany Mejia": "Tiffany",
     "Zoltan Miskolci": "Zoltan",
-    "Sarina Cheung": "Sarina", 
+    "Sarina Cheung": "Sarina",
     "Tisha Patel": "Tisha",
-    "Ethan Nguyen": "Ethan", 
+    "Ethan Nguyen": "Ethan",
     "Arpita Srivastava": "Arpita",
-    "Michael Garthwaite": "Michael", 
+    "Michael Garthwaite": "Michael",
     "Praneeth Bunne": "Praneeth",
-    "Sameer Poyil": "Sameer", 
+    "Sameer Poyil": "Sameer",
     "Varshini Nagabooshanam": "Varshini",
-    "Vijay Pamula": "Vijay", 
+    "Vijay Pamula": "Vijay",
     "Suresh Dharnala": "Suresh",
-    "Dara Navaei": "Dara", 
+    "Dara Navaei": "Dara",
     "Eliza Petersen": "Eliza",
-    "Stephen Quong": "Stephen", 
+    "Stephen Quong": "Stephen",
     "Christina Heine": "Christina",
-    "Caitlynn Chang": "Caitlynn", 
+    "Caitlynn Chang": "Caitlynn",
     "Santhos Kumar Reddy": "Santhos",
-    "Abhijit Barman": "Abhijit", 
+    "Abhijit Barman": "Abhijit",
     "Chris Yu": "Chris",
-    "Vitas Buenaventura": "Vitas", 
+    "Vitas Buenaventura": "Vitas",
     "Emiline Hernandez": "Emiline",
 }
 
+# Build a fast lookup from full name or nickname to team index.
 _ASSIGNEE_TO_TEAM_IDX: dict = {}
 for _ti, _team in enumerate(TEAMS):
     for _full in _team:
@@ -123,6 +124,7 @@ _LAST_COL = chr(ord('A') + NUM_COLS - 1)  # 'L'
 # ═══════════════════════════════════════════════════════════════════
 
 def _fetch_paginated(url, jql, auth):
+    # Fetch all issues from a paginated Jira REST API endpoint.
     all_issues, start_at = [], 0
     while True:
         params = {
@@ -140,15 +142,18 @@ def _fetch_paginated(url, jql, auth):
 
 
 def _sprint_names(s):
+    # Parse a comma-separated sprint name string into a set of names.
     return {n.strip() for n in s.split(",") if n.strip()} if s else set()
 
 
 def _sprint_num(name):
+    # Extract the integer sprint number from a sprint name string.
     m = re.search(r'(\d+)', name)
     return int(m.group(1)) if m else -1
 
 
 def _has_sprint_history(issue):
+    # Return True if the issue has appeared in any sprint >= MIN_SPRINT.
     for history in issue["changelog"]["histories"]:
         for item in history["items"]:
             if item["field"] != "Sprint":
@@ -160,12 +165,14 @@ def _has_sprint_history(issue):
 
 
 def _assignee_nickname(display_name: str) -> str:
+    # Return the configured nickname for a display name, or the first name.
     if not display_name:
         return "Unassigned"
     return NICKNAME_MAP.get(display_name, display_name.split()[0])
 
 
 def _team_for_nickname(nickname):
+    # Look up the (team_name, team_index) pair for the given nickname.
     idx = _ASSIGNEE_TO_TEAM_IDX.get(nickname)
     if idx is None:
         return None, _UNMATCHED_TEAM_IDX
@@ -173,6 +180,7 @@ def _team_for_nickname(nickname):
 
 
 def _adf_to_text(node) -> str:
+    # Recursively extract plain text from an Atlassian Document Format node.
     if isinstance(node, str):
         return node
     if not isinstance(node, dict):
@@ -183,6 +191,7 @@ def _adf_to_text(node) -> str:
 
 
 def _latest_jira_note(issue, auth) -> Optional[str]:
+    # Return the most recent xlsx-tagged note text from the issue's comments.
     comment_field = issue["fields"].get("comment") or {}
     comments = list(comment_field.get("comments", []))
     if comment_field.get("total", len(comments)) > len(comments):
@@ -200,6 +209,12 @@ def _latest_jira_note(issue, auth) -> Optional[str]:
 
 
 def get_jira_issues():
+    """Fetch all relevant issues from the Jira board and backlog.
+
+    Collects issues from open and future sprints on board 84, plus
+    any backlog items that have sprint history back to MIN_SPRINT.
+    Attaches the most recent xlsx-tagged Jira note to each issue.
+    """
     auth = HTTPBasicAuth(os.getenv("JIRA_EMAIL"), os.getenv("JIRA_API_TOKEN"))
 
     board_issues = _fetch_paginated(
@@ -223,6 +238,10 @@ def get_jira_issues():
 
 
 def parse_date(date_str):
+    """Parse an ISO 8601 date string into a timezone-aware datetime.
+
+    Returns None if date_str is empty or None.
+    """
     if not date_str:
         return None
     date_str = date_str.replace("Z", "+00:00")
@@ -231,6 +250,11 @@ def parse_date(date_str):
 
 
 def get_type(issue):
+    """Return the display issue type string for the given Jira issue.
+
+    Classifies the issue as one of: Bug, Dialin ticket, Little-V,
+    Support, or Big-V based on issuetype name and summary text.
+    """
     issuetype = issue["fields"]["issuetype"]["name"].lower()
     summary = issue["fields"].get("summary", "").lower()
     if "dialin" in issuetype or "dialin" in summary:
@@ -245,6 +269,12 @@ def get_type(issue):
 
 
 def get_status(issue, issue_type) -> str:
+    """Return the display status string for the given Jira issue.
+
+    Applies BUG_STATUS_MAP for Bug and Dialin ticket issue types.
+    For all other types, maps Jira status categories to simplified
+    display strings such as 'Done', 'In-progress', or 'Not started'.
+    """
     status = issue["fields"]["status"]
     status_name = status["name"]
     if issue_type in BUG_DIALIN_TYPES:
@@ -270,6 +300,7 @@ def get_status(issue, issue_type) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 def _classify_sprint_timing(sprint, histories):
+    # Return 'Added' if issue was added after sprint start, else 'Scoped'.
     sprint_name = sprint["name"]
     sprint_start_dt = parse_date(sprint.get("startDate"))
     if not sprint_start_dt:
@@ -294,6 +325,11 @@ def _classify_sprint_timing(sprint, histories):
 
 
 def get_sprint_history(issue, max_sprint_num):
+    """Return a sorted list of (sprint_num, scope) pairs for the issue.
+
+    Scope values are 'Scoped', 'Added', or MOVED_OUT.  Only sprint
+    numbers in the range [MIN_SPRINT, max_sprint_num] are included.
+    """
     histories = issue["changelog"]["histories"]
     sprint_info = issue["fields"].get("customfield_10020") or []
     current_sprint_names = {s["name"] for s in sprint_info}
@@ -325,6 +361,7 @@ def get_sprint_history(issue, max_sprint_num):
 
 
 def _original_assignee_for_sprint(issue, sprint_obj) -> str:
+    # Return the assignee nickname at the time the sprint first went active.
     fields = issue["fields"]
     histories = issue["changelog"]["histories"]
     current_full = fields["assignee"]["displayName"] if fields.get("assignee") else ""
@@ -375,6 +412,7 @@ def _original_assignee_for_sprint(issue, sprint_obj) -> str:
 
 
 def _sprint_started(sprint_num, sprint_map):
+    # Return True if the given sprint number has already started or closed.
     s = sprint_map.get(sprint_num)
     if not s:
         return True
@@ -388,6 +426,7 @@ def _sprint_started(sprint_num, sprint_map):
 
 
 def _extract_key(label):
+    # Extract the Jira issue key from a '[KEY] summary' label string.
     m = re.match(r'\[([A-Z]+-\d+)\]', str(label) if label is not None else '')
     return m.group(1) if m else None
 
@@ -406,6 +445,7 @@ def _gv(grid, row, col):
 
 
 def _norm_sprint(v):
+    # Normalize a sprint cell value to an integer, or None on failure.
     try:
         return int(v)
     except (TypeError, ValueError):
@@ -428,7 +468,6 @@ def _issue_row_cells(record):
             current_assignee, issue_type, record["scope"], has_desc, label, status]
 
 
-
 def _hyperlink_formula(label):
     """Build =HYPERLINK(url, label) from a '[KEY] summary' label."""
     key = _extract_key(label)
@@ -439,9 +478,16 @@ def _hyperlink_formula(label):
 
 
 def update_via_workbook(helper, item_id, session_id, issues):
-    """Incrementally update the Sprint Template sheet via the Graph Workbook API."""
+    """Incrementally update the Sprint Template sheet via the Workbook API.
+
+    Reads the live sheet grid, reconciles it against current Jira state
+    for the active and next sprints, then writes all changes (values,
+    HYPERLINK formulas, and font/alignment formatting) in a single
+    atomic pass.  Returns the current sprint number.
+    """
 
     def wb(method, rel, body=None):
+        # Dispatch a Workbook API request through the SharePoint helper.
         return helper.workbook_request(method, item_id, session_id, rel, body)
 
     # ── Read the live grid ──
@@ -517,6 +563,19 @@ def update_via_workbook(helper, item_id, session_id, issues):
             cells = [_gv(grid, r, c) for c in range(1, NUM_COLS + 1)]
             existing.setdefault((key, sn), []).append({"row": r, "cells": cells})
 
+    # ── Build prev_k_map: ticket key -> K value from the most recent older sprint ──
+    prev_k_map = {}
+    for r in range(DATA_START_ROW, last_data_row + 1):
+        sn = _norm_sprint(_gv(grid, r, 1))
+        if sn is not None and sn not in target_set:
+            key = _extract_key(_gv(grid, r, 8))
+            if key:
+                k_val = _gv(grid, r, 11)
+                if k_val is not None:
+                    prev = prev_k_map.get(key)
+                    if prev is None or sn > prev[0]:
+                        prev_k_map[key] = (sn, k_val)
+
     # Find the contiguous region of target-sprint rows
     target_rows = [d["row"] for lst in existing.values() for d in lst]
     if target_rows:
@@ -546,8 +605,15 @@ def update_via_workbook(helper, item_id, session_id, issues):
                 cells[:9] = a_to_i
                 cells[9] = first["cells"][9]    # preserve J (manual note)
                 cells[11] = first["cells"][11]  # preserve L (manual note)
+                existing_k = first["cells"][10]
+                if not existing_k:
+                    prev_entry = prev_k_map.get(composite[0])
+                    existing_k = prev_entry[1] if prev_entry else None
                 jira_note = api_map[composite].get("jira_note")
-                cells[10] = jira_note if jira_note is not None else first["cells"][10]
+                if jira_note is not None:
+                    cells[10] = f"{existing_k} Jira: {jira_note}" if existing_k else f"Jira: {jira_note}"
+                else:
+                    cells[10] = existing_k
                 final[sn].append(cells)
                 updated += 1
         else:
@@ -569,11 +635,18 @@ def update_via_workbook(helper, item_id, session_id, issues):
         a_to_i = _issue_row_cells(api_map[composite])
         cells = [None] * NUM_COLS
         cells[:9] = a_to_i
-        cells[10] = api_map[composite].get("jira_note")
+        prev_entry = prev_k_map.get(composite[0])
+        prev_k = prev_entry[1] if prev_entry else None
+        jira_note = api_map[composite].get("jira_note")
+        if jira_note is not None:
+            cells[10] = f"{prev_k} Jira: {jira_note}" if prev_k else f"Jira: {jira_note}"
+        else:
+            cells[10] = prev_k
         final[sn].append(cells)
 
     # Sort each sprint block by team then assignee
     def _sort_key(cells):
+        # Sort rows by team index, then alphabetically by original assignee name.
         orig = cells[2]  # col C = original assignee
         _, ti = _team_for_nickname(orig)
         return (ti, orig or "")
@@ -668,6 +741,7 @@ def apply_sprint_filter(helper, item_id, session_id, current_sprint_num):
     otherwise the Table range won't include newly inserted rows.
     """
     def wb(method, rel, body=None):
+        # Dispatch a Workbook API request through the SharePoint helper.
         return helper.workbook_request(method, item_id, session_id, rel, body)
 
     try:
@@ -694,6 +768,7 @@ def apply_sprint_filter(helper, item_id, session_id, current_sprint_num):
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
+    """Archive the target file, sync Jira data, and apply the sprint filter."""
     helper = SharePointHelper()
 
     print("Fetching issues from Jira...")
