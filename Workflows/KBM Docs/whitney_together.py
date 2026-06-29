@@ -129,7 +129,9 @@ def createWordComparison(oldDocPath, newDocPath):
 #################### MACROS ####################
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 RECORDS_FOLDER  = os.path.join(_SCRIPT_DIR, 'KBM Docs')
-OUTDATED_FOLDER = os.path.join(RECORDS_FOLDER, 'outdated')
+OUTDATED_FOLDER = os.path.join(RECORDS_FOLDER, 'Outdated')
+REDLINE_FOLDER  = os.path.join(RECORDS_FOLDER, 'Redline')
+PREV_REV_FOLDER = os.path.join(RECORDS_FOLDER, 'Previous Revisions')
 JSON_PATH       = os.path.join(_SCRIPT_DIR, 'kbm_map.json')
 
 __lenVersionStr = 9
@@ -202,7 +204,7 @@ def version_score(filename):
 def collect_files(folder):
     pdf_files  = []
     docx_files = []
-    skip = {'outdated', 'redline'}
+    skip = {'outdated', 'redline', 'previous revisions'}
     for root, dirs, files in os.walk(folder):
         dirs[:] = [d for d in dirs if d.lower() not in skip]
         for name in files:
@@ -299,7 +301,7 @@ def update_excel(excel_path):
 
         if docx_path is None:
             no_docx += 1
-            missing_doc_ids.append(doc_id)
+            missing_doc_ids.append((doc_id, os.path.basename(pdf_path)))
 
         ws.cell(row=start_row, column=1, value=index)
         ws.cell(row=start_row, column=2, value=pdf_path)
@@ -319,8 +321,8 @@ def update_excel(excel_path):
 
     if missing_doc_ids:
         print('\nDOCX files needed (add to folder):')
-        for doc_id in missing_doc_ids:
-            print(f'  {doc_id}')
+        for doc_id, pdf_name in missing_doc_ids:
+            print(f'  {doc_id} — {pdf_name}')
 
     return missing_doc_ids
 
@@ -328,6 +330,45 @@ def update_excel(excel_path):
 # ═══════════════════════════════════════════════════════════════════════════════
 # MISSING DOCS MENU
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def display_file_summary(docDF):
+    pdf_paths = docDF["PDF Path"].values
+    docx_paths = docDF["DOCX Path"].values
+
+    matched = []
+    missing = []
+
+    for i in range(len(docDF)):
+        pdf_name = os.path.basename(str(pdf_paths[i])) if pd.notna(pdf_paths[i]) else "N/A"
+        docx_val = docx_paths[i]
+        has_docx = pd.notna(docx_val) and str(docx_val).strip() != ""
+
+        if has_docx:
+            docx_name = os.path.basename(str(docx_val))
+            matched.append((pdf_name, docx_name))
+        else:
+            missing.append(pdf_name)
+
+    print(f"\n{'='*80}")
+    print("FILE SUMMARY")
+    print(f"{'='*80}")
+
+    if matched:
+        print(f"\nMatched files ({len(matched)}):")
+        print(f"  {'PDF':<55} {'DOCX'}")
+        print(f"  {'-'*55} {'-'*55}")
+        for pdf_name, docx_name in matched:
+            print(f"  {pdf_name:<55} {docx_name}")
+
+    if missing:
+        print(f"\nMissing DOCX ({len(missing)}):")
+        for pdf_name in missing:
+            print(f"  [!] {pdf_name}")
+
+    print(f"\n  Total: {len(matched)} matched, {len(missing)} missing")
+    print(f"{'='*80}")
+    input("\nPress Enter to continue...")
+
 
 def get_user_menu_choice(prompt, options):
     print(f"\n{prompt}")
@@ -452,6 +493,11 @@ def process_documents(docDF, mode, doc_indices=None):
     """Process documents based on selected mode and scope"""
     global revisionStr, revisionInt, docPathNew
 
+    if mode in (1, 3):
+        os.makedirs(REDLINE_FOLDER, exist_ok=True)
+    if mode in (1, 2):
+        os.makedirs(PREV_REV_FOLDER, exist_ok=True)
+
     if doc_indices is None:
         rows_to_process = range(len(docDF))
     else:
@@ -491,12 +537,9 @@ def process_documents(docDF, mode, doc_indices=None):
             redline_path = oldDocPath[:(len(oldDocPath) - 5)] + "_REDLINE.docx"
             if os.path.exists(redline_path):
                 redline_filename = os.path.basename(redline_path)
-                dest_redline_path = os.path.join(RECORDS_FOLDER, redline_filename)
-                if os.path.dirname(redline_path) != RECORDS_FOLDER:
-                    shutil.move(redline_path, dest_redline_path)
-                    print(f"  Moved redline to KBM Docs folder: {redline_filename}")
-                else:
-                    print(f"  Created redline: {redline_filename}")
+                dest_redline_path = os.path.join(REDLINE_FOLDER, redline_filename)
+                shutil.move(redline_path, dest_redline_path)
+                print(f"  Moved redline to Redline folder: {redline_filename}")
 
             continue
 
@@ -524,6 +567,11 @@ def process_documents(docDF, mode, doc_indices=None):
         if mode == 1:
             createWordComparison(docPathInitial, docPathNew)
             time.sleep(2)
+            redline_path = docPathInitial[:(len(docPathInitial) - 5)] + "_REDLINE.docx"
+            if os.path.exists(redline_path):
+                dest_redline = os.path.join(REDLINE_FOLDER, os.path.basename(redline_path))
+                shutil.move(redline_path, dest_redline)
+                print(f"  Moved redline to Redline folder: {os.path.basename(redline_path)}")
         else:  # mode == 2
             print(f"  [SKIPPED REDLINE] As requested for 'Create only new rev' mode")
 
@@ -538,17 +586,19 @@ def process_documents(docDF, mode, doc_indices=None):
         dia_match = re.search(r"DIA\s+[A-Z]+-\d+[A-Z]?\.\d+", os.path.basename(pdf))
         dia_id = dia_match.group(0) if dia_match else ""
 
-        dest_folder = os.path.join(docx_dir, f"{text_after} ({dia_id})")
+        part_number = item_match.group(0) if item_match else ""
+        folder_prefix = f"{part_number}, " if part_number else ""
+        dest_folder = os.path.join(docx_dir, f"{folder_prefix}{text_after} ({dia_id})")
         os.makedirs(dest_folder, exist_ok=True)
 
         if os.path.exists(docPathInitial) and not re.search(r'red', os.path.basename(docPathInitial), re.IGNORECASE):
-            shutil.move(docPathInitial, os.path.join(dest_folder, os.path.basename(docPathInitial)))
+            shutil.move(docPathInitial, os.path.join(PREV_REV_FOLDER, os.path.basename(docPathInitial)))
         if os.path.exists(docPathNew) and not re.search(r'red', os.path.basename(docPathNew), re.IGNORECASE):
             shutil.move(docPathNew, os.path.join(dest_folder, os.path.basename(docPathNew)))
         if os.path.exists(pdf):
             shutil.move(pdf, os.path.join(dest_folder, os.path.basename(pdf)))
 
-        print(f"  Organized: {text_after} ({dia_id})")
+        print(f"  Organized: {folder_prefix}{text_after} ({dia_id})")
 
 
 def main():
@@ -572,6 +622,10 @@ def main():
             print("\nAborted. Please update KBM Docs and run again.")
             sys.exit(0)
         print("\nContinuing with processing (missing docs will be skipped)...")
+
+    # Display file summary
+    docDF_preview = pd.read_excel(EXCEL_PATH)
+    display_file_summary(docDF_preview)
 
     # Step 3: Read the excel file
     print("\n" + "="*60)
