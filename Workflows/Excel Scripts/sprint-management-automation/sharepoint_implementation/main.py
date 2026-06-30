@@ -4,19 +4,37 @@ Uses the Graph Workbook API for incremental edits so the file can be
 updated even while someone has it open in Excel Online.
 """
 
+import logging
 import os
 import re
 from datetime import datetime
+from logging.handlers import TimedRotatingFileHandler
 from typing import Optional
 
 import requests
 from dotenv import load_dotenv
 from requests.auth import HTTPBasicAuth
 
-from config import ARCHIVE_PATH, SPRINT_TEMPLATE_FILE
-from sharepoint_helper import SharePointHelper
+from config import (
+    ARCHIVE_PATH, LOG_FORMAT, LOG_LEVEL, LOG_RETENTION_DAYS, LOGS_DIR,
+    SHAREPOINT_SYNC_PATH, SPRINT_TEMPLATE_FILE,
+)
+from sharepoint_helper import SharePointHelper, SharePointOperationError
 
 load_dotenv()
+
+# ── Logging: console + daily rotating file, so cron runs leave a trail ──
+os.makedirs(LOGS_DIR, exist_ok=True)
+_file_handler = TimedRotatingFileHandler(
+    os.path.join(LOGS_DIR, "leahi_sprint.log"),
+    when="midnight", backupCount=LOG_RETENTION_DAYS, encoding="utf-8",
+)
+_file_handler.suffix = "%Y-%m-%d"
+logging.basicConfig(
+    level=LOG_LEVEL, format=LOG_FORMAT,
+    handlers=[logging.StreamHandler(), _file_handler], force=True,
+)
+logger = logging.getLogger(__name__)
 
 # ── Jira ──
 BASE_URL = "https://diality.atlassian.net"
@@ -125,17 +143,23 @@ _LAST_COL = chr(ord('A') + NUM_COLS - 1)  # 'L'
 
 def _fetch_paginated(url, jql, auth):
     # Fetch all issues from a paginated Jira REST API endpoint.
+    logger.debug(f"Fetching paginated Jira results from {url} | jql={jql}")
     all_issues, start_at = [], 0
     while True:
         params = {
             "fields": "summary,status,assignee,issuetype,customfield_10020,description,comment",
             "expand": "changelog", "jql": jql, "maxResults": 100, "startAt": start_at,
         }
-        resp = requests.get(url, params=params, auth=auth)
-        resp.raise_for_status()
+        try:
+            resp = requests.get(url, params=params, auth=auth, timeout=30)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            logger.error(f"Jira request failed: {url} | jql={jql} | startAt={start_at} | {e}")
+            raise
         data = resp.json()
         all_issues.extend(data["issues"])
         start_at += len(data["issues"])
+        logger.debug(f"Fetched {start_at}/{data.get('total', '?')} issues from {url}")
         if start_at >= data.get("total", 0) or not data["issues"]:
             break
     return all_issues
@@ -196,7 +220,13 @@ def _latest_jira_note(issue, auth) -> Optional[str]:
     comments = list(comment_field.get("comments", []))
     if comment_field.get("total", len(comments)) > len(comments):
         url = f"{BASE_URL}/rest/api/2/issue/{issue['key']}/comment"
-        comments = requests.get(url, params={"maxResults": 1000}, auth=auth).json().get("comments", [])
+        try:
+            resp = requests.get(url, params={"maxResults": 1000}, auth=auth, timeout=30)
+            resp.raise_for_status()
+            comments = resp.json().get("comments", [])
+        except requests.RequestException as e:
+            logger.error(f"Failed to fetch full comment list for {issue['key']}: {e}")
+            raise
 
     best_text, best_created = None, ""
     for comment in comments:
@@ -215,14 +245,22 @@ def get_jira_issues():
     any backlog items that have sprint history back to MIN_SPRINT.
     Attaches the most recent xlsx-tagged Jira note to each issue.
     """
-    auth = HTTPBasicAuth(os.getenv("JIRA_EMAIL"), os.getenv("JIRA_API_TOKEN"))
+    jira_email = os.getenv("JIRA_EMAIL")
+    jira_token = os.getenv("JIRA_API_TOKEN")
+    if not jira_email or not jira_token:
+        logger.error("Missing JIRA_EMAIL or JIRA_API_TOKEN in environment")
+        raise RuntimeError("Missing JIRA_EMAIL or JIRA_API_TOKEN in .env")
+    auth = HTTPBasicAuth(jira_email, jira_token)
 
+    logger.info("Fetching board issues (open/future sprints) from Jira")
     board_issues = _fetch_paginated(
         f"{BASE_URL}/rest/agile/1.0/board/84/issue",
         "sprint in openSprints() OR sprint in futureSprints()", auth,
     )
+    logger.info(f"Fetched {len(board_issues)} board issues")
     seen = {i["key"] for i in board_issues}
 
+    logger.info("Fetching backlog issues from Jira")
     all_backlog = _fetch_paginated(
         f"{BASE_URL}/rest/agile/1.0/board/84/backlog",
         f"project = {PROJECT}", auth,
@@ -230,10 +268,20 @@ def get_jira_issues():
     backlog_with_history = [
         i for i in all_backlog if i["key"] not in seen and _has_sprint_history(i)
     ]
+    logger.info(
+        f"Fetched {len(all_backlog)} backlog issues, "
+        f"{len(backlog_with_history)} with sprint history >= {MIN_SPRINT}"
+    )
 
     all_issues = board_issues + backlog_with_history
+    logger.info(f"Fetching Jira notes (xlsx<>xlsx comments) for {len(all_issues)} issues")
     for issue in all_issues:
-        issue["_jira_note"] = _latest_jira_note(issue, auth)
+        try:
+            issue["_jira_note"] = _latest_jira_note(issue, auth)
+        except requests.RequestException as e:
+            logger.error(f"Failed to fetch Jira note for {issue.get('key', '?')}: {e}")
+            raise
+    logger.info(f"Completed Jira fetch: {len(all_issues)} total issues")
     return all_issues
 
 
@@ -452,6 +500,41 @@ def _norm_sprint(v):
         return None
 
 
+def _build_sync_index(sync_grid):
+    """Index the sync file's grid as (ticket_key, sprint_num) -> {'J': val, 'K': val}.
+
+    The sync file is the team's hand-maintained source of truth for the
+    Prediction (J) and Status Note / Justification (K) columns.
+    """
+    idx = {}
+    for r in range(DATA_START_ROW, len(sync_grid) + 1):
+        sn = _norm_sprint(_gv(sync_grid, r, 1))
+        if sn is None:
+            continue
+        key = _extract_key(_gv(sync_grid, r, 8))
+        if not key:
+            continue
+        idx[(key, sn)] = {"J": _gv(sync_grid, r, 10), "K": _gv(sync_grid, r, 11)}
+    return idx
+
+
+def _sync_note_for(sync_idx, key, sprint_num, field):
+    """Return the sync file's note for (key, sprint_num), falling back to the
+    most recent older sprint's note for that ticket if this sprint has none.
+    """
+    exact = sync_idx.get((key, sprint_num))
+    if exact and exact.get(field):
+        return exact[field]
+    candidates = [
+        (sn, vals[field]) for (k, sn), vals in sync_idx.items()
+        if k == key and sn < sprint_num and vals.get(field)
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[-1][1]
+
+
 def _issue_row_cells(record):
     """Build the A..I values list for a Jira record."""
     issue = record["issue"]
@@ -477,13 +560,16 @@ def _hyperlink_formula(label):
     return f'=HYPERLINK("{BASE_URL}/browse/{key}","{lbl}")'
 
 
-def update_via_workbook(helper, item_id, session_id, issues):
+def update_via_workbook(helper, item_id, session_id, issues, sync_item_id):
     """Incrementally update the Sprint Template sheet via the Workbook API.
 
     Reads the live sheet grid, reconciles it against current Jira state
     for the active and next sprints, then writes all changes (values,
     HYPERLINK formulas, and font/alignment formatting) in a single
     atomic pass.  Returns the current sprint number.
+
+    sync_item_id identifies the hand-maintained sync file that J/K notes
+    are sourced from; pass the same value as item_id if they're the same file.
     """
 
     def wb(method, rel, body=None):
@@ -491,16 +577,35 @@ def update_via_workbook(helper, item_id, session_id, issues):
         return helper.workbook_request(method, item_id, session_id, rel, body)
 
     # ── Read the live grid ──
+    logger.info("Reading live sheet grid")
     used = wb("GET", f"{_WS}/usedRange?$select=values,rowCount,address")
     grid = used.get("values", [])
     total_rows = used.get("rowCount", len(grid))
-    print(f"[DIAG] usedRange address: {used.get('address')}, rowCount: {total_rows}, grid rows: {len(grid)}")
+    logger.info(f"Grid read: address={used.get('address')}, rowCount={total_rows}")
+
+    # ── Read the sync file's grid (source of truth for J/K notes) ──
+    if sync_item_id == item_id:
+        logger.info("Sync file is the same as the template file; reusing the loaded grid")
+        sync_grid = grid
+    else:
+        logger.info("Reading sync file grid for J/K note lookup")
+        sync_session_id = helper.open_workbook_session(sync_item_id, persist=False)
+        try:
+            sync_used = helper.workbook_request(
+                "GET", sync_item_id, sync_session_id, f"{_WS}/usedRange?$select=values,rowCount")
+            sync_grid = sync_used.get("values", [])
+        finally:
+            helper.close_workbook_session(sync_item_id, sync_session_id)
+        logger.info(f"Sync file grid read: {len(sync_grid)} rows")
+    sync_idx = _build_sync_index(sync_grid)
+    logger.info(f"Built sync index: {len(sync_idx)} (ticket, sprint) entries")
 
     # Find last row with actual data in A..I
     last_data_row = DATA_START_ROW - 1
     for r in range(DATA_START_ROW, total_rows + 1):
         if any(_gv(grid, r, c) is not None for c in range(1, 10)):
             last_data_row = r
+    logger.debug(f"Last data row: {last_data_row}")
 
     # ── Sprint targets (from Jira) ──
     active_sprint_nums = []
@@ -517,6 +622,7 @@ def update_via_workbook(helper, item_id, session_id, issues):
     next_sprint_num = current_sprint_num + 1
     target_sprints = (current_sprint_num, next_sprint_num)
     target_set = set(target_sprints)
+    logger.info(f"Target sprints: current={current_sprint_num}, next={next_sprint_num}")
 
     # ── Sprint object lookup ──
     sprint_map = {}
@@ -549,32 +655,17 @@ def update_via_workbook(helper, item_id, session_id, issues):
                 "jira_note": issue.get("_jira_note"),
                 "original_assignee": original_assignee, "team": team_name,
             }
+    logger.info(f"Built api_map: {len(api_map)} active tickets, {len(sys_excluded)} SYS-excluded")
 
     # ── Index existing target-sprint rows from the live grid ──
     existing = {}  # (key, sprint) -> [{"row": int, "cells": list}, ...]
-    print(f"\n[DIAG] === EXISTING GRID ROWS (col H raw values) ===")
     for r in range(DATA_START_ROW, last_data_row + 1):
         sn = _norm_sprint(_gv(grid, r, 1))
-        raw_h = _gv(grid, r, 8)
-        key = _extract_key(raw_h)
-        if sn in target_set:
-            print(f"  Excel row {r} | sprint={sn} | key={key} | raw H={repr(raw_h)}")
+        key = _extract_key(_gv(grid, r, 8))
         if key and sn in target_set:
             cells = [_gv(grid, r, c) for c in range(1, NUM_COLS + 1)]
             existing.setdefault((key, sn), []).append({"row": r, "cells": cells})
-
-    # ── Build prev_k_map: ticket key -> K value from the most recent older sprint ──
-    prev_k_map = {}
-    for r in range(DATA_START_ROW, last_data_row + 1):
-        sn = _norm_sprint(_gv(grid, r, 1))
-        if sn is not None and sn not in target_set:
-            key = _extract_key(_gv(grid, r, 8))
-            if key:
-                k_val = _gv(grid, r, 11)
-                if k_val is not None:
-                    prev = prev_k_map.get(key)
-                    if prev is None or sn > prev[0]:
-                        prev_k_map[key] = (sn, k_val)
+    logger.info(f"Indexed {len(existing)} existing target-sprint rows from the sheet")
 
     # Find the contiguous region of target-sprint rows
     target_rows = [d["row"] for lst in existing.values() for d in lst]
@@ -603,17 +694,14 @@ def update_via_workbook(helper, item_id, session_id, issues):
                 a_to_i = _issue_row_cells(api_map[composite])
                 cells = [None] * NUM_COLS
                 cells[:9] = a_to_i
-                cells[9] = first["cells"][9]    # preserve J (manual note)
                 cells[11] = first["cells"][11]  # preserve L (manual note)
-                existing_k = first["cells"][10]
-                if not existing_k:
-                    prev_entry = prev_k_map.get(composite[0])
-                    existing_k = prev_entry[1] if prev_entry else None
+                cells[9] = _sync_note_for(sync_idx, composite[0], sn, "J")
+                sync_k = _sync_note_for(sync_idx, composite[0], sn, "K")
                 jira_note = api_map[composite].get("jira_note")
                 if jira_note is not None:
-                    cells[10] = f"{existing_k} Jira: {jira_note}" if existing_k else f"Jira: {jira_note}"
+                    cells[10] = f"{sync_k} Jira: {jira_note}" if sync_k else f"Jira: {jira_note}"
                 else:
-                    cells[10] = existing_k
+                    cells[10] = sync_k
                 final[sn].append(cells)
                 updated += 1
         else:
@@ -635,13 +723,13 @@ def update_via_workbook(helper, item_id, session_id, issues):
         a_to_i = _issue_row_cells(api_map[composite])
         cells = [None] * NUM_COLS
         cells[:9] = a_to_i
-        prev_entry = prev_k_map.get(composite[0])
-        prev_k = prev_entry[1] if prev_entry else None
+        cells[9] = _sync_note_for(sync_idx, composite[0], sn, "J")
+        sync_k = _sync_note_for(sync_idx, composite[0], sn, "K")
         jira_note = api_map[composite].get("jira_note")
         if jira_note is not None:
-            cells[10] = f"{prev_k} Jira: {jira_note}" if prev_k else f"Jira: {jira_note}"
+            cells[10] = f"{sync_k} Jira: {jira_note}" if sync_k else f"Jira: {jira_note}"
         else:
-            cells[10] = prev_k
+            cells[10] = sync_k
         final[sn].append(cells)
 
     # Sort each sprint block by team then assignee
@@ -655,65 +743,83 @@ def update_via_workbook(helper, item_id, session_id, issues):
     for sn in target_sprints:
         final_rows.extend(sorted(final[sn], key=_sort_key))
     fin_n = len(final_rows)
-
-    print(f"\n[DIAG] === FINAL ROWS TO WRITE ({fin_n} rows) ===")
-    print(f"  {'Row':>4} | {'Sprint':>6} | {'Team':>4} | {'Assignee':<12} | {'Key':<12} | Col H (label)")
-    print(f"  {'----':>4} | {'------':>6} | {'----':>4} | {'--------':<12} | {'---':<12} | -----")
-    for i, row in enumerate(final_rows):
-        label = row[7]
-        key = _extract_key(label)
-        print(f"  {region_start + i:>4} | {row[0]:>6} | {str(row[1]):>4} | {str(row[3]):<12} | {key or '???':<12} | {repr(label)}")
+    logger.info(
+        f"Final row set built: {fin_n} rows "
+        f"({updated} updated, {len(new_composites)} new, {removed} marked-removed, {deleted} deleted)"
+    )
 
     # ── Reconcile row count: insert or delete rows as needed ──
     delta = fin_n - region_cur_n
     if delta > 0:
+        logger.info(f"Inserting {delta} row(s) at row {region_start + region_cur_n}")
         ins_at = region_start + region_cur_n
-        for _ in range(delta):
-            wb("POST", f"{_WS}/range(address='{ins_at}:{ins_at}')/insert",
-               {"shift": "Down"})
+        try:
+            for _ in range(delta):
+                wb("POST", f"{_WS}/range(address='{ins_at}:{ins_at}')/insert",
+                   {"shift": "Down"})
+        except SharePointOperationError:
+            logger.error(f"Failed inserting rows at {ins_at}")
+            raise
     elif delta < 0:
+        logger.info(f"Deleting {-delta} row(s) from {region_start + fin_n} to {region_start + region_cur_n - 1}")
         del_start = region_start + fin_n
         del_end = region_start + region_cur_n - 1
-        for r in range(del_end, del_start - 1, -1):
-            wb("POST", f"{_WS}/range(address='{r}:{r}')/delete",
-               {"shift": "Up"})
+        try:
+            for r in range(del_end, del_start - 1, -1):
+                wb("POST", f"{_WS}/range(address='{r}:{r}')/delete",
+                   {"shift": "Up"})
+        except SharePointOperationError:
+            logger.error(f"Failed deleting rows {del_start}-{del_end}")
+            raise
 
     if fin_n == 0:
-        print("No active rows for target sprints; nothing to write.")
+        logger.info("No active rows for target sprints; nothing to write.")
     else:
         end_row = region_start + fin_n - 1
 
         # ── Single atomic write: values + HYPERLINK formulas in col H ──
+        logger.info(f"Writing {fin_n} rows to A{region_start}:{_LAST_COL}{end_row}")
         formulas_grid = []
         for row in final_rows:
             frow = list(row)
             frow[7] = _hyperlink_formula(row[7])
             formulas_grid.append(frow)
-        wb("PATCH", f"{_WS}/range(address='A{region_start}:{_LAST_COL}{end_row}')",
-           {"formulas": formulas_grid})
+        try:
+            wb("PATCH", f"{_WS}/range(address='A{region_start}:{_LAST_COL}{end_row}')",
+               {"formulas": formulas_grid})
+        except SharePointOperationError:
+            logger.error(f"Failed writing rows to A{region_start}:{_LAST_COL}{end_row}")
+            raise
+        logger.info("Row data written successfully")
 
         # ── Formatting: type color on col E (batched by contiguous same-color runs) ──
+        logger.debug("Applying type color formatting to column E")
         types = [row[4] for row in final_rows]
         i = 0
-        while i < fin_n:
-            color = TYPE_FONT_COLORS.get(types[i], "000000")
-            j = i
-            while j + 1 < fin_n and TYPE_FONT_COLORS.get(types[j + 1], "000000") == color:
-                j += 1
-            r1, r2 = region_start + i, region_start + j
-            wb("PATCH", f"{_WS}/range(address='E{r1}:E{r2}')/format/font",
-               {"color": f"#{color}"})
-            i = j + 1
+        try:
+            while i < fin_n:
+                color = TYPE_FONT_COLORS.get(types[i], "000000")
+                j = i
+                while j + 1 < fin_n and TYPE_FONT_COLORS.get(types[j + 1], "000000") == color:
+                    j += 1
+                r1, r2 = region_start + i, region_start + j
+                wb("PATCH", f"{_WS}/range(address='E{r1}:E{r2}')/format/font",
+                   {"color": f"#{color}"})
+                i = j + 1
 
-        # Col H: blue underlined link style
-        wb("PATCH", f"{_WS}/range(address='H{region_start}:H{end_row}')/format/font",
-           {"color": "#1155CC", "underline": "Single"})
+            # Col H: blue underlined link style
+            wb("PATCH", f"{_WS}/range(address='H{region_start}:H{end_row}')/format/font",
+               {"color": "#1155CC", "underline": "Single"})
 
-        # Alignment on all written cells
-        wb("PATCH", f"{_WS}/range(address='A{region_start}:{_LAST_COL}{end_row}')/format",
-           {"horizontalAlignment": "Left", "verticalAlignment": "Center"})
+            # Alignment on all written cells
+            wb("PATCH", f"{_WS}/range(address='A{region_start}:{_LAST_COL}{end_row}')/format",
+               {"horizontalAlignment": "Left", "verticalAlignment": "Center"})
+        except SharePointOperationError:
+            logger.error("Failed applying formatting to written rows")
+            raise
+        logger.debug("Formatting applied successfully")
 
-        print(
+        logger.info(
             f"Done via Workbook API "
             f"(sprints {current_sprint_num}/{next_sprint_num} | "
             f"{len(api_map)} active, {len(issues)} tickets | "
@@ -724,8 +830,13 @@ def update_via_workbook(helper, item_id, session_id, issues):
 
     # ── "Last Updated" timestamp in H2 ──
     now = datetime.now().strftime("%m/%d/%Y %I:%M %p")
-    wb("PATCH", f"{_WS}/range(address='H2')",
-       {"values": [[f"Last Updated: {now}"]]})
+    try:
+        wb("PATCH", f"{_WS}/range(address='H2')",
+           {"values": [[f"Last Updated: {now}"]]})
+    except SharePointOperationError:
+        logger.error("Failed writing 'Last Updated' timestamp to H2")
+        raise
+    logger.info(f"Last Updated timestamp written: {now}")
 
     return current_sprint_num
 
@@ -744,6 +855,7 @@ def apply_sprint_filter(helper, item_id, session_id, current_sprint_num):
         # Dispatch a Workbook API request through the SharePoint helper.
         return helper.workbook_request(method, item_id, session_id, rel, body)
 
+    logger.info(f"Applying sprint filter for sprint {current_sprint_num}")
     try:
         tables_resp = wb("GET", f"{_WS}/tables")
         table_list = tables_resp.get("value", [])
@@ -755,12 +867,13 @@ def apply_sprint_filter(helper, item_id, session_id, current_sprint_num):
                    "criterion1": f"={current_sprint_num}",
                    "filterOn": "Custom"
                }})
-            print(f"Table filter applied: showing only Sprint {current_sprint_num}")
+            logger.info(f"Table filter applied: showing only Sprint {current_sprint_num}")
         else:
-            print("Warning: no Excel Table found on sheet; "
-                  "cannot set filter programmatically via Graph API")
-    except Exception as e:
-        print(f"Warning: could not apply filter: {e}")
+            logger.warning("No Excel Table found on sheet; cannot set filter programmatically via Graph API")
+    except Exception:
+        # Non-fatal: the data write already succeeded, so log and continue
+        # rather than failing the whole run over a cosmetic filter step.
+        logger.exception("Could not apply sprint filter")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -769,31 +882,46 @@ def apply_sprint_filter(helper, item_id, session_id, current_sprint_num):
 
 def main():
     """Archive the target file, sync Jira data, and apply the sprint filter."""
-    helper = SharePointHelper()
-
-    print("Fetching issues from Jira...")
-    issues = get_jira_issues()
-    print(f"Found {len(issues)} issues")
-
-    print(f"Archiving: {SPRINT_TEMPLATE_FILE}")
-    archive_path = helper.archive_file(SPRINT_TEMPLATE_FILE, archive_folder=ARCHIVE_PATH)
-    print(f"Archived: {archive_path}")
-
-    item_id = helper.get_item_id(SPRINT_TEMPLATE_FILE)
-
-    print("Updating Sprint Template via Workbook API...")
-    session_id = helper.open_workbook_session(item_id)
+    logger.info("=== Leahi Sprint Management sync starting ===")
     try:
-        current_sprint_num = update_via_workbook(helper, item_id, session_id, issues)
-    finally:
-        helper.close_workbook_session(item_id, session_id)
+        helper = SharePointHelper()
 
-    print("Applying sprint filter...")
-    session_id = helper.open_workbook_session(item_id)
-    try:
-        apply_sprint_filter(helper, item_id, session_id, current_sprint_num)
-    finally:
-        helper.close_workbook_session(item_id, session_id)
+        logger.info("Fetching issues from Jira...")
+        issues = get_jira_issues()
+        logger.info(f"Found {len(issues)} issues")
+
+        logger.info(f"Archiving: {SPRINT_TEMPLATE_FILE}")
+        archive_path = helper.archive_file(SPRINT_TEMPLATE_FILE, archive_folder=ARCHIVE_PATH)
+        logger.info(f"Archived to: {archive_path}")
+
+        item_id = helper.get_item_id(SPRINT_TEMPLATE_FILE)
+        if SHAREPOINT_SYNC_PATH == SPRINT_TEMPLATE_FILE:
+            sync_item_id = item_id
+        else:
+            sync_item_id = helper.get_item_id(SHAREPOINT_SYNC_PATH)
+
+        logger.info("Updating Sprint Template via Workbook API...")
+        session_id = helper.open_workbook_session(item_id)
+        try:
+            current_sprint_num = update_via_workbook(
+                helper, item_id, session_id, issues, sync_item_id)
+        except Exception:
+            logger.exception("Failed updating Sprint Template via Workbook API")
+            raise
+        finally:
+            helper.close_workbook_session(item_id, session_id)
+
+        logger.info("Applying sprint filter...")
+        session_id = helper.open_workbook_session(item_id)
+        try:
+            apply_sprint_filter(helper, item_id, session_id, current_sprint_num)
+        finally:
+            helper.close_workbook_session(item_id, session_id)
+
+        logger.info("=== Leahi Sprint Management sync completed successfully ===")
+    except Exception:
+        logger.exception("=== Leahi Sprint Management sync FAILED ===")
+        raise
 
 
 if __name__ == "__main__":
