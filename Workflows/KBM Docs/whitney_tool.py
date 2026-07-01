@@ -20,8 +20,8 @@ import win32com.client.gencache
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QRadioButton, QButtonGroup,
-    QTextEdit, QProgressBar, QStackedWidget, QListWidget, QListWidgetItem,
-    QMessageBox
+    QTextEdit, QProgressBar, QStackedWidget, QTreeWidget, QTreeWidgetItem,
+    QMessageBox, QCheckBox
 )
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont
@@ -141,7 +141,7 @@ docPathNew = ""
 ####################################################
 
 
-# Read current rev from header, return the next one (01->02)
+# Read current rev from header, return the next one (A->B or 01->02)
 def getRevisionInteger(section, strRev, newRev):
     for table in section.header.tables:
         for row in table.rows:
@@ -149,11 +149,14 @@ def getRevisionInteger(section, strRev, newRev):
                 if "Revision" in cell.text:
                     strRev = cell.text[__lenRevisionStr:]
 
-    newRev = int(strRev) + 1
-    if newRev < 10:
-        newRev = '0' + str(newRev)
+    if strRev.isalpha():
+        newRev = chr(ord(strRev) + 1)
     else:
-        newRev = str(newRev)
+        newRev = int(strRev) + 1
+        if newRev < 10:
+            newRev = '0' + str(newRev)
+        else:
+            newRev = str(newRev)
 
     return newRev
 
@@ -233,23 +236,37 @@ def createWordComparison(oldDocPath, newDocPath):
 
     while numRetries < __maxRetries:
         _wait_for_word_exit()
+        wordApp = None
         try:
             wordApp = handleDispatch("Word.Application")
             wordApp.Visible = False
-            old_doc = wordApp.Documents.Open(oldDocPath)
-            new_doc = wordApp.Documents.Open(newDocPath)
+            old_doc = wordApp.Documents.Open(oldDocPath, Visible=False)
+            new_doc = wordApp.Documents.Open(newDocPath, Visible=False)
             wordApp.CompareDocuments(old_doc, new_doc)
 
         except Exception as e:
-            print(f"Attempt {numRetries + 1} failed: {e}")
+            print(f"[DEBUG] Attempt {numRetries + 1} failed: {e}")
             numRetries += 1
+            if wordApp:
+                try:
+                    wordApp.Quit()
+                except Exception:
+                    pass
+                del wordApp
+                _wait_for_word_exit()
             time.sleep(__delay * numRetries)
 
         else:
-            wordApp.ActiveDocument.SaveAs(FileName=(oldDocPath[:(len(oldDocPath) - 5)] + "_REDLINE.docx"))
-            old_doc.Close(False)
-            new_doc.Close(False)
-            wordApp.Quit()
+            try:
+                wordApp.ActiveDocument.SaveAs(FileName=(oldDocPath[:(len(oldDocPath) - 5)] + "_REDLINE.docx"))
+                old_doc.Close(False)
+                new_doc.Close(False)
+                wordApp.Quit()
+            except Exception:
+                try:
+                    wordApp.Quit()
+                except Exception:
+                    pass
             del wordApp
             _wait_for_word_exit()
             return
@@ -449,9 +466,7 @@ def revision_sort_key(rev_str):
 
 # Find the two highest revisions of a doc for redline comparison
 def find_top_two_revisions(docx_path):
-    docx_dir = os.path.dirname(docx_path)
     docx_basename = os.path.basename(docx_path)
-    parent_dir = os.path.dirname(docx_dir)
 
     item_match = re.search(r"10\d{4}", docx_basename)
     if not item_match:
@@ -459,8 +474,9 @@ def find_top_two_revisions(docx_path):
 
     item_no = item_match.group(0)
 
+    # Always search from RECORDS_FOLDER root so nested or root-level docs are treated the same
     matching_files = []
-    for root, _, files in os.walk(parent_dir):
+    for root, _, files in os.walk(RECORDS_FOLDER):
         for fname in files:
             if fname.lower().endswith('.docx') and item_no in fname and 'red' not in fname.lower():
                 full_path = os.path.join(root, fname)
@@ -504,7 +520,6 @@ def read_word_document(pdf_path, docx_path):
     versionStr = firstPageStr[(versionPos + __lenVersionStr):(versionPos + __lenEndVersionStr)].strip()
     dateStr     = find_date(firstPageStr)
 
-    print(f"{docx_path}|{versionStr}|{dateStr}")
     return doc, versionStr, dateStr
 
 
@@ -525,6 +540,8 @@ def process_documents(docDF, mode, doc_indices=None, progress_callback=None):
     pdf_paths = docDF["PDF Path"].values
     docx_paths = docDF["DOCX Path"].values
 
+    print(f"Path: {RECORDS_FOLDER}\n")
+
     for i, row_idx in enumerate(rows_to_process):
         if progress_callback:
             progress_callback(i + 1, total)
@@ -533,15 +550,14 @@ def process_documents(docDF, mode, doc_indices=None, progress_callback=None):
         docPathInitial = docx_paths[row_idx]
 
         if not pdf or (isinstance(pdf, float) and pd.isna(pdf)) or not str(pdf).strip():
-            print(f"\n[SKIPPED] Row {row_idx + 1}: Missing PDF path")
+            print(f"[DEBUG] Skipped: Row {row_idx + 1} — Missing PDF path")
             continue
         if not docPathInitial or (isinstance(docPathInitial, float) and pd.isna(docPathInitial)) or not str(docPathInitial).strip():
-            print(f"\n[SKIPPED] Row {row_idx + 1}: Missing DOCX path")
+            print(f"[DEBUG] Skipped: Row {row_idx + 1} — Missing DOCX path")
             continue
 
         print(f"\n{'='*60}")
-        print(f"Processing row {row_idx + 1}: {os.path.basename(docPathInitial)}")
-        print(f"{'='*60}")
+        print(f"Processing: {os.path.basename(docPathInitial)}")
 
         if mode == 3:
             oldDocPath, newDocPath = find_top_two_revisions(docPathInitial)
@@ -558,7 +574,7 @@ def process_documents(docDF, mode, doc_indices=None, progress_callback=None):
                 redline_filename = os.path.basename(redline_path)
                 dest_redline_path = os.path.join(REDLINE_FOLDER, redline_filename)
                 shutil.move(redline_path, dest_redline_path)
-                print(f"  Moved redline to Redline folder: {redline_filename}")
+                print(f"Moved redline to Redline folder:{redline_filename}")
 
             continue
 
@@ -583,17 +599,20 @@ def process_documents(docDF, mode, doc_indices=None, progress_callback=None):
 
         docPathNew = docPathRevUpdate(doc, docPathInitial, revisionInt, docPathNew)
 
+        pdf_label = os.path.splitext(os.path.basename(pdf))[0]
+        print(f"\nCreated: {os.path.basename(docPathNew)}")
+        print(f"         [{pdf_label} – Date: {dateStr}]")
+
         if mode == 1:
             createWordComparison(docPathInitial, docPathNew)
             redline_path = docPathInitial[:(len(docPathInitial) - 5)] + "_REDLINE.docx"
             if os.path.exists(redline_path):
                 dest_redline = os.path.join(REDLINE_FOLDER, os.path.basename(redline_path))
                 shutil.move(redline_path, dest_redline)
-                print(f"  Moved redline to Redline folder: {os.path.basename(redline_path)}")
+                print(f"Moved redline to Redline folder:{os.path.basename(redline_path)}")
         else:
-            print(f"  [SKIPPED REDLINE] As requested for 'Create only new rev' mode")
+            print(f"[DEBUG] Skipped Redline: As requested for 'Create only new rev' mode")
 
-        docx_dir = os.path.dirname(docPathInitial)
         docx_filename = os.path.splitext(os.path.basename(docPathInitial))[0]
 
         item_match = re.search(r"10\d{4}", docx_filename)
@@ -601,12 +620,12 @@ def process_documents(docDF, mode, doc_indices=None, progress_callback=None):
         text_after = re.sub(r"^[,\s]+", "", text_after)
         text_after = re.sub(r",?\s*Rev\s?[A-Z0-9]+", "", text_after).strip().rstrip(",").strip()
 
-        dia_match = re.search(r"DIA\s+[A-Z]+-\d+[A-Z]?\.\d+", os.path.basename(pdf))
-        dia_id = dia_match.group(0) if dia_match else ""
+        dia_id = extract_dia_code(os.path.basename(pdf)) or ""
 
         part_number = item_match.group(0) if item_match else ""
         folder_prefix = f"{part_number}, " if part_number else ""
-        dest_folder = os.path.join(docx_dir, f"{folder_prefix}{text_after} ({dia_id})")
+        # Always place organized folder at RECORDS_FOLDER root to avoid double-nesting on re-runs
+        dest_folder = os.path.join(RECORDS_FOLDER, f"{folder_prefix}{text_after} ({dia_id})")
 
         if os.path.exists(docPathInitial) and not re.search(r'red', os.path.basename(docPathInitial), re.IGNORECASE):
             shutil.move(docPathInitial, os.path.join(PREV_REV_FOLDER, os.path.basename(docPathInitial)))
@@ -617,7 +636,7 @@ def process_documents(docDF, mode, doc_indices=None, progress_callback=None):
             os.makedirs(dest_folder, exist_ok=True)
             shutil.move(pdf, os.path.join(dest_folder, os.path.basename(pdf)))
 
-        print(f"  Organized: {folder_prefix}{text_after} ({dia_id})")
+        print(f"[DEBUG] Organized: {folder_prefix}{text_after} ({dia_id})")
 
 
 ####################################################
@@ -698,8 +717,12 @@ class FolderPage(QWidget):
 
     def __init__(self):
         super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        layout = QVBoxLayout()
+        layout.setSpacing(8)
+        layout.setContentsMargins(16, 16, 16, 16)
 
         title = QLabel("Select KBM Docs Folder")
         title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
@@ -708,8 +731,6 @@ class FolderPage(QWidget):
         desc = QLabel("Choose the folder containing your PDF and DOCX files.")
         desc.setWordWrap(True)
         layout.addWidget(desc)
-
-        layout.addStretch()
 
         self.folder_label = QLabel("No folder selected")
         self.folder_label.setStyleSheet("color: #666; font-style: italic;")
@@ -721,7 +742,8 @@ class FolderPage(QWidget):
         browse_btn.clicked.connect(self._browse)
         layout.addWidget(browse_btn)
 
-        layout.addStretch()
+        outer.addLayout(layout)
+        outer.addStretch()
 
         self.selected_folder = ""
 
@@ -836,7 +858,7 @@ class SummaryPage(QWidget):
         if matched:
             self.summary_text.append(f"\nMatched files ({len(matched)}):")
             for pdf_name, docx_name in matched:
-                self.summary_text.append(f"  {pdf_name}  ->  {docx_name}")
+                self.summary_text.append(f"\n  {pdf_name}\n  ->  {docx_name}")
 
         if missing:
             self.summary_text.append(f"\nMissing DOCX ({len(missing)}):")
@@ -888,8 +910,13 @@ class MissingDocsPage(QWidget):
 class ModePage(QWidget):
     def __init__(self):
         super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        # Inner layout holds all controls packed tightly at the top
+        layout = QVBoxLayout()
+        layout.setSpacing(8)
+        layout.setContentsMargins(16, 16, 16, 16)
 
         title = QLabel("Select Operation")
         title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
@@ -914,70 +941,112 @@ class ModePage(QWidget):
         layout.addWidget(self.mode_rev_only)
         layout.addWidget(self.mode_redline_only)
 
-        # --- Scope selection ---
-        scope_label = QLabel("Scope:")
-        scope_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        layout.addWidget(scope_label)
+        # --- Document checklist ---
+        doc_list_label = QLabel("Documents to process:")
+        doc_list_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        layout.addWidget(doc_list_label)
 
-        self.scope_group = QButtonGroup(self)
-        self.scope_all = QRadioButton("Affect all documents")
-        self.scope_select = QRadioButton("Select specific documents")
-        self.scope_all.setChecked(True)
+        sel_row = QHBoxLayout()
+        self.select_all_cb = QCheckBox("Select All")
+        self.select_new_cb = QCheckBox("Select New")
+        sel_row.addWidget(self.select_all_cb)
+        sel_row.addWidget(self.select_new_cb)
+        sel_row.addStretch()
+        layout.addLayout(sel_row)
 
-        self.scope_group.addButton(self.scope_all, 1)
-        self.scope_group.addButton(self.scope_select, 2)
-
-        layout.addWidget(self.scope_all)
-        layout.addWidget(self.scope_select)
-
-        # --- Document checklist (shown when scope = select) ---
-        self.doc_list_label = QLabel("Select documents to process:")
-        self.doc_list_label.hide()
-        layout.addWidget(self.doc_list_label)
-
-        self.doc_list = QListWidget()
-        self.doc_list.hide()
+        self.doc_list = QTreeWidget()
+        self.doc_list.setHeaderHidden(True)
+        self.doc_list.setRootIsDecorated(False)
+        self.doc_list.setItemsExpandable(False)
         layout.addWidget(self.doc_list)
 
-        self.scope_select.toggled.connect(self._on_scope_changed)
+        outer.addLayout(layout)
+        outer.addStretch()  # pushes everything up regardless of window height
 
-    def _on_scope_changed(self, checked):
-        self.doc_list_label.setVisible(checked)
-        self.doc_list.setVisible(checked)
+        self.select_all_cb.stateChanged.connect(self._on_select_all_changed)
+        self.select_new_cb.stateChanged.connect(self._on_select_new_changed)
+
+    def _on_select_all_changed(self, state):
+        check = Qt.CheckState.Checked if state == Qt.CheckState.Checked.value else Qt.CheckState.Unchecked
+        for i in range(self.doc_list.topLevelItemCount()):
+            top = self.doc_list.topLevelItem(i)
+            if top.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                top.setCheckState(0, check)
+            for j in range(top.childCount()):
+                child = top.child(j)
+                if child.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                    child.setCheckState(0, check)
+
+    def _on_select_new_changed(self, state):
+        check = Qt.CheckState.Checked if state == Qt.CheckState.Checked.value else Qt.CheckState.Unchecked
+        for i in range(self.doc_list.topLevelItemCount()):
+            top = self.doc_list.topLevelItem(i)
+            if top.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                top.setCheckState(0, check)
 
     def populate_docs(self, docDF):
+        self.select_all_cb.setChecked(False)
+        self.select_new_cb.setChecked(False)
         self.doc_list.clear()
         pdf_paths = docDF["PDF Path"].values
 
-        for i in range(len(pdf_paths)):
-            pdf_val = pdf_paths[i]
-            if pd.notna(pdf_val) and str(pdf_val).strip():
-                name = os.path.basename(str(pdf_val))
-                item = QListWidgetItem(name)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(Qt.CheckState.Unchecked)
-                item.setData(Qt.ItemDataRole.UserRole, i)
-                self.doc_list.addItem(item)
+        root_docs = []
+        grouped = {}
+
+        for i, pdf_val in enumerate(pdf_paths):
+            if not (pd.notna(pdf_val) and str(pdf_val).strip()):
+                continue
+            pdf_str = str(pdf_val)
+            rel = os.path.relpath(os.path.dirname(pdf_str), RECORDS_FOLDER)
+            entry = (i, pdf_str)
+            if rel == '.':
+                root_docs.append(entry)
+            else:
+                grouped.setdefault(rel, []).append(entry)
+
+        def add_file_item(parent, row_idx, pdf_path):
+            name = os.path.basename(pdf_path)
+            dia_code = extract_dia_code(name)
+            doc_id = get_id_from_json(KBM_MAP, dia_code, normalize(name)) if dia_code else None
+            label = name + (f" ({doc_id})" if doc_id else "")
+            item = QTreeWidgetItem(parent)
+            item.setText(0, label)
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable)
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+            item.setData(0, Qt.ItemDataRole.UserRole, row_idx)
+
+        for row_idx, pdf_path in root_docs:
+            add_file_item(self.doc_list, row_idx, pdf_path)
+
+        for folder_name, entries in sorted(grouped.items()):
+            folder_item = QTreeWidgetItem(self.doc_list)
+            folder_item.setText(0, folder_name)
+            folder_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            folder_item.setFont(0, QFont("Segoe UI", 9, QFont.Weight.Bold))
+            folder_item.setExpanded(True)
+            for row_idx, pdf_path in entries:
+                add_file_item(folder_item, row_idx, pdf_path)
 
     def get_mode(self):
         return self.mode_group.checkedId()
 
     def get_selected_indices(self):
-        if self.scope_all.isChecked():
-            return None
         indices = []
-        for i in range(self.doc_list.count()):
-            item = self.doc_list.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
-                indices.append(item.data(Qt.ItemDataRole.UserRole))
+        for i in range(self.doc_list.topLevelItemCount()):
+            top = self.doc_list.topLevelItem(i)
+            if (top.flags() & Qt.ItemFlag.ItemIsUserCheckable) and top.checkState(0) == Qt.CheckState.Checked:
+                indices.append(top.data(0, Qt.ItemDataRole.UserRole))
+            for j in range(top.childCount()):
+                child = top.child(j)
+                if (child.flags() & Qt.ItemFlag.ItemIsUserCheckable) and child.checkState(0) == Qt.CheckState.Checked:
+                    indices.append(child.data(0, Qt.ItemDataRole.UserRole))
         return indices
 
     def reset(self):
         self.mode_rev_and_redline.setChecked(True)
-        self.scope_all.setChecked(True)
+        self.select_all_cb.setChecked(False)
+        self.select_new_cb.setChecked(False)
         self.doc_list.clear()
-        self.doc_list.hide()
-        self.doc_list_label.hide()
 
 
 # ─── Page 4: Processing / Results ────────────────────────────────────────────
@@ -1005,6 +1074,9 @@ class ProcessingPage(QWidget):
         self.log_output.setFont(QFont("Consolas", 9))
         layout.addWidget(self.log_output)
 
+        self.debug_cb = QCheckBox("Show Debug Info")
+        layout.addWidget(self.debug_cb)
+
         btn_layout = QHBoxLayout()
         self.save_btn = QPushButton("Save Log")
         self.start_over_btn = QPushButton("Start Over")
@@ -1020,11 +1092,24 @@ class ProcessingPage(QWidget):
         btn_layout.addWidget(self.close_btn)
         layout.addLayout(btn_layout)
 
+        self._log_entries = []  # list of (text, is_debug)
+
         self.save_btn.clicked.connect(self._save_log)
         self.close_btn.clicked.connect(QApplication.quit)
+        self.debug_cb.stateChanged.connect(lambda _: self._render_log())
 
     def append_log(self, text):
-        self.log_output.append(text)
+        is_debug = text.strip().startswith("[DEBUG]")
+        self._log_entries.append((text, is_debug))
+        self._render_log()
+
+    def _render_log(self):
+        debug_on = self.debug_cb.isChecked()
+        parts = []
+        for text, is_debug in self._log_entries:
+            if not is_debug or debug_on:
+                parts.append(text if text.endswith("\n") else text + "\n")
+        self.log_output.setPlainText("".join(parts))
         scrollbar = self.log_output.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
@@ -1049,10 +1134,9 @@ class ProcessingPage(QWidget):
         self.title_label.setText("Aborted")
         self.progress_bar.hide()
         self.progress_label.hide()
-        self.log_output.setText(
-            "Operation aborted by user.\n"
-            "Missing DOCX files were detected and the user chose to abort."
-        )
+        self._log_entries = []
+        self.append_log("Operation aborted by user.")
+        self.append_log("Missing DOCX files were detected and the user chose to abort.")
         self._show_result_buttons()
 
     def _show_result_buttons(self):
@@ -1075,6 +1159,7 @@ class ProcessingPage(QWidget):
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(100)
         self.progress_bar.show()
+        self._log_entries = []
         self.log_output.clear()
         self.save_btn.hide()
         self.start_over_btn.hide()
