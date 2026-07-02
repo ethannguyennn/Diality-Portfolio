@@ -49,6 +49,9 @@ NUM_COLS = 12
 RETRO_SHEET_NAME = "Sprint Retro"
 RETRO_NUM_COLS = 3  # A "What went well?" .. C "What can we improve?"
 
+# ── Sprint Summary sheet layout ──
+SUMMARY_SHEET_NAME = "Sprint Summary"
+
 # ── Teams ──
 SWVV_TEAM = [
     "Raghu Kallala", "Thomas Lippold", "Tejaskumar Patel", "Tiffany Mejia",
@@ -142,6 +145,8 @@ _LAST_COL = chr(ord('A') + NUM_COLS - 1)  # 'L'
 
 _WS_RETRO = f"worksheets('{RETRO_SHEET_NAME}')"
 _RETRO_LAST_COL = chr(ord('A') + RETRO_NUM_COLS - 1)  # 'C'
+
+_WS_SUMMARY = f"worksheets('{SUMMARY_SHEET_NAME}')"
 
 # Sprint Retro header block styling, confirmed against the existing
 # manually-created Sprint 31/32 blocks already on the sheet (rowHeight is
@@ -993,6 +998,130 @@ def ensure_sprint_retro_header(helper, item_id, session_id, current_sprint_num):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Sprint Summary sheet (aggregate stats, separate sheet, separate session)
+# ═══════════════════════════════════════════════════════════════════
+
+def _col_letter(n: int) -> str:
+    """Convert a 1-based column index to its spreadsheet letter (1 -> A, 27 -> AA)."""
+    letters = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(ord('A') + rem) + letters
+    return letters
+
+
+def _f_scope_count(col_letter, r):
+    # COUNTIF of Template col F (scope) over the sprint's row range, keyed on the column's own header.
+    return (f"=COUNTIF(INDEX('{SHEET_NAME}'!$F:$F,$B{r}):INDEX('{SHEET_NAME}'!$F:$F,$C{r}),"
+            f"{col_letter}$1)")
+
+
+def _f_status_pct(col_letter, r):
+    # "<count> (<pct of Committed>)" for a status column (Done/In-progress/Not Started/Blocked).
+    return (f"=LET(\nDoneCount,COUNTIF(INDEX('{SHEET_NAME}'!$I:$I,$B{r}):"
+            f"INDEX('{SHEET_NAME}'!$I:$I,$C{r}),{col_letter}$1),\nTotalTasks,$G{r},\n"
+            f"IF(OR(DoneCount=0,TotalTasks=0),\"\",DoneCount&\" (\"&"
+            f"TEXT(DoneCount/TotalTasks,\"0.0%\")&\")\")\n)")
+
+
+def _f_type_pct(col_letter, r):
+    # "<count> (<pct of Scoped+Added>)" for a ticket-type column (Little-V/Big-V/Dialin/Bug/Support).
+    return (f"=LET(\nDoneCount,COUNTIF(INDEX('{SHEET_NAME}'!$E:$E,$B{r}):"
+            f"INDEX('{SHEET_NAME}'!$E:$E,$C{r}),{col_letter}$1),\n"
+            f"IF(DoneCount=0,\"\",DoneCount&\" (\"&"
+            f"TEXT(DoneCount/($E{r}+$F{r}),\"0.0%\")&\")\")\n)")
+
+
+def _f_person_pct(col_letter, r):
+    # "<done> / <assigned> (<pct>)" for one team member's column, keyed on the column's own header.
+    return (
+        f"=LET(\nAssigned,\nSUM(\nCOUNTIFS(\n"
+        f"INDEX('{SHEET_NAME}'!$D:$D,$B{r}):INDEX('{SHEET_NAME}'!$D:$D,$C{r}),{col_letter}$1,\n"
+        f"INDEX('{SHEET_NAME}'!$F:$F,$B{r}):INDEX('{SHEET_NAME}'!$F:$F,$C{r}),{{\"Scoped\",\"Added\"}}\n"
+        f")\n),\nDone,\nCOUNTIFS(\n"
+        f"INDEX('{SHEET_NAME}'!$D:$D,$B{r}):INDEX('{SHEET_NAME}'!$D:$D,$C{r}),{col_letter}$1,\n"
+        f"INDEX('{SHEET_NAME}'!$I:$I,$B{r}):INDEX('{SHEET_NAME}'!$I:$I,$C{r}),\"Done\"\n"
+        f"),\nIF(\nAssigned=0,\n\"\",\nDone&\" / \"&Assigned&\" (\"&"
+        f"TEXT(Done/Assigned,\"0.0%\")&\")\"\n)\n)"
+    )
+
+
+# Columns T(20)..AP(42): one per team member, in whatever order the sheet's
+# header row already has them -- this mirrors the existing hand-built rows
+# (29-31) exactly, just generated instead of copy-pasted.
+_SUMMARY_PERSON_COLS = range(20, 43)
+
+
+def _build_summary_row_formulas(sprint_num, r):
+    """Build the A..AQ formula row for one Sprint Summary row.
+
+    Mirrors the formulas already hand-built for the existing sprint rows
+    (29-31) so the sheet stays self-consistent -- every cell recalculates
+    live from the Sprint Template sheet via its Start/End row (B/C).
+    """
+    row = [""] * 43  # A..AQ; columns without a header (M, S, AQ) stay blank
+    row[0] = sprint_num
+    row[1] = f"=MATCH(A{r},'{SHEET_NAME}'!$A:$A,0)"
+    row[2] = f"=LOOKUP(2,1/('{SHEET_NAME}'!$A:$A=A{r}),ROW('{SHEET_NAME}'!$A:$A))"
+    row[3] = f"=C{r}-B{r}+1"
+    row[4] = _f_scope_count("E", r)
+    row[5] = _f_scope_count("F", r)
+    row[6] = f"=E{r}+F{r}"
+    row[7] = _f_scope_count("H", r)
+    for col_idx in range(9, 13):  # I..L
+        row[col_idx - 1] = _f_status_pct(_col_letter(col_idx), r)
+    for col_idx in range(14, 19):  # N..R
+        row[col_idx - 1] = _f_type_pct(_col_letter(col_idx), r)
+    for col_idx in _SUMMARY_PERSON_COLS:  # T..AP
+        row[col_idx - 1] = _f_person_pct(_col_letter(col_idx), r)
+    return row
+
+
+def ensure_sprint_summary_row(helper, item_id, session_id, current_sprint_num):
+    """Write (or refresh) the current sprint's row on the Sprint Summary sheet.
+
+    'Sprint Summary' is one row per sprint, formula-driven off the Sprint
+    Template sheet's Start/End rows -- this only ever touches the row for
+    current_sprint_num, appending a new one if it isn't there yet. Column A
+    is scanned to find or place that row; every other sprint's row, the
+    header, and the manually-authored Challenges column are left untouched.
+    """
+    def wb(method, rel, body=None):
+        return helper.workbook_request(method, item_id, session_id, rel, body)
+
+    try:
+        logger.info(f"Ensuring Sprint Summary row for sprint {current_sprint_num}")
+        used = wb("GET", f"{_WS_SUMMARY}/usedRange?$select=values,rowCount,address")
+        grid = used.get("values", [])
+        total_rows = used.get("rowCount", len(grid))
+
+        target_row, last_row = None, 1  # row 1 is the header
+        for r in range(2, total_rows + 1):
+            sn = _norm_sprint(_gv(grid, r, 1))
+            if sn is not None:
+                last_row = r
+                if sn == current_sprint_num:
+                    target_row = r
+
+        is_new = target_row is None
+        if is_new:
+            target_row = last_row + 1
+
+        row_formulas = _build_summary_row_formulas(current_sprint_num, target_row)
+        wb("PATCH", f"{_WS_SUMMARY}/range(address='A{target_row}:AQ{target_row}')",
+           {"formulas": [row_formulas]})
+
+        logger.info(
+            f"Sprint Summary row for sprint {current_sprint_num} "
+            f"{'created' if is_new else 'refreshed'} at row {target_row}"
+        )
+    except Exception:
+        # Non-fatal: the core Jira sync already succeeded, so log and move
+        # on rather than failing the whole cron run over the summary sheet.
+        logger.exception("Could not ensure Sprint Summary row")
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Entry point
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1038,6 +1167,13 @@ def main():
         session_id = helper.open_workbook_session(item_id)
         try:
             ensure_sprint_retro_header(helper, item_id, session_id, current_sprint_num)
+        finally:
+            helper.close_workbook_session(item_id, session_id)
+
+        logger.info("Ensuring Sprint Summary row...")
+        session_id = helper.open_workbook_session(item_id)
+        try:
+            ensure_sprint_summary_row(helper, item_id, session_id, current_sprint_num)
         finally:
             helper.close_workbook_session(item_id, session_id)
 
