@@ -519,20 +519,24 @@ def _build_sync_index(sync_grid):
 
 
 def _sync_note_for(sync_idx, key, sprint_num, field):
-    """Return the sync file's note for (key, sprint_num), falling back to the
-    most recent older sprint's note for that ticket if this sprint has none.
-    """
-    exact = sync_idx.get((key, sprint_num))
-    if exact and exact.get(field):
-        return exact[field]
-    candidates = [
-        (sn, vals[field]) for (k, sn), vals in sync_idx.items()
-        if k == key and sn < sprint_num and vals.get(field)
-    ]
-    if not candidates:
+    """Return the sync file's J or K value for exactly (key, sprint_num), or None."""
+    entry = sync_idx.get((key, sprint_num))
+    return entry.get(field) if entry else None
+
+
+def _strip_jira_suffix(k_val):
+    """Remove the ' Jira: ...' tail this script appends, leaving only the human-authored portion."""
+    if not k_val:
         return None
-    candidates.sort(key=lambda x: x[0])
-    return candidates[-1][1]
+    stripped = re.sub(r'\s*Jira:.*$', '', str(k_val), flags=re.DOTALL).strip()
+    return stripped or None
+
+
+def _build_k(base_k, jira_note):
+    """Combine an optional human base note with an optional Jira note into a K cell value."""
+    if jira_note is not None:
+        return f"{base_k} Jira: {jira_note}".strip() if base_k else f"Jira: {jira_note}"
+    return base_k or ""
 
 
 def _issue_row_cells(record):
@@ -694,14 +698,15 @@ def update_via_workbook(helper, item_id, session_id, issues, sync_item_id):
                 a_to_i = _issue_row_cells(api_map[composite])
                 cells = [None] * NUM_COLS
                 cells[:9] = a_to_i
+                cells[9] = first["cells"][9]   # preserve J (employee-maintained)
                 cells[11] = first["cells"][11]  # preserve L (manual note)
-                cells[9] = _sync_note_for(sync_idx, composite[0], sn, "J")
-                sync_k = _sync_note_for(sync_idx, composite[0], sn, "K")
-                jira_note = api_map[composite].get("jira_note")
-                if jira_note is not None:
-                    cells[10] = f"{sync_k} Jira: {jira_note}" if sync_k else f"Jira: {jira_note}"
+                if sync_item_id == item_id:
+                    # Sync source is the template itself — strip the old Jira suffix we
+                    # wrote last run so we don't compound "Jira: x Jira: x" each run.
+                    base_k = _strip_jira_suffix(first["cells"][10])
                 else:
-                    cells[10] = sync_k
+                    base_k = _sync_note_for(sync_idx, composite[0], sn, "K")
+                cells[10] = _build_k(base_k, api_map[composite].get("jira_note"))
                 final[sn].append(cells)
                 updated += 1
         else:
@@ -723,13 +728,9 @@ def update_via_workbook(helper, item_id, session_id, issues, sync_item_id):
         a_to_i = _issue_row_cells(api_map[composite])
         cells = [None] * NUM_COLS
         cells[:9] = a_to_i
-        cells[9] = _sync_note_for(sync_idx, composite[0], sn, "J")
-        sync_k = _sync_note_for(sync_idx, composite[0], sn, "K")
-        jira_note = api_map[composite].get("jira_note")
-        if jira_note is not None:
-            cells[10] = f"{sync_k} Jira: {jira_note}" if sync_k else f"Jira: {jira_note}"
-        else:
-            cells[10] = sync_k
+        # J (index 9) left as None — new row starts blank, employees fill it in
+        base_k = None if sync_item_id == item_id else _sync_note_for(sync_idx, composite[0], sn, "K")
+        cells[10] = _build_k(base_k, api_map[composite].get("jira_note"))
         final[sn].append(cells)
 
     # Sort each sprint block by team then assignee
@@ -782,7 +783,10 @@ def update_via_workbook(helper, item_id, session_id, issues, sync_item_id):
         formulas_grid = []
         for row in final_rows:
             frow = list(row)
+            frow[1] = row[1] if row[1] is not None else ""   # B: team — write "" not None
             frow[7] = _hyperlink_formula(row[7])
+            frow[9] = row[9] if row[9] is not None else ""   # J: clear stale on row shift
+            frow[11] = row[11] if row[11] is not None else "" # L: clear stale on row shift
             formulas_grid.append(frow)
         try:
             wb("PATCH", f"{_WS}/range(address='A{region_start}:{_LAST_COL}{end_row}')",
