@@ -281,7 +281,7 @@ function main(workbook: ExcelScript.Workbook): void {
     //  UPDATE TOC  ← NEW
     // ══════════════════════════════════════════════════════════════
     updateTOC(workbook, sprint, sheetName, TOC_SHEET);
-    updateVelocityChart(workbook, rawData, TOC_SHEET);
+    updateVelocityChart(workbook, rawData, TOC_SHEET, sprint);
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -293,10 +293,11 @@ function main(workbook: ExcelScript.Workbook): void {
 function updateVelocityChart(
     workbook: ExcelScript.Workbook,
     rawData: (string | number | boolean)[][],
-    tocName: string
+    tocName: string,
+    currentSprint: number
 ): void {
     const C_SPRINT = 0;
-    const C_SCOPE  = 5;
+    const C_SCOPE = 5;
     const C_STATUS = 8;
     const CHART_TITLE = "Sprint Committed vs Done with Completion %";
 
@@ -304,11 +305,13 @@ function updateVelocityChart(
     if (!toc) return;
 
     // ── Aggregate committed / done counts by sprint ───────────────
+    // Future sprints (> currentSprint) are excluded — they have no real data yet.
     const sprintData: { [num: number]: { committed: number; done: number } } = {};
     for (const row of rawData) {
         const sprintNum = Number(row[C_SPRINT]);
         if (!sprintNum || isNaN(sprintNum)) continue;
-        const scope  = String(row[C_SCOPE]).trim();
+        if (sprintNum > currentSprint) continue;
+        const scope = String(row[C_SCOPE]).trim();
         const status = String(row[C_STATUS]).trim();
         if (scope === "Move out of Sprint") continue;
         if (!sprintData[sprintNum]) sprintData[sprintNum] = { committed: 0, done: 0 };
@@ -330,11 +333,11 @@ function updateVelocityChart(
         catch (_e) { /* chart has no title */ }
     });
 
-    // ── Clear old data table area: E2 down 12 rows (header + 10 + buffer) ──
-    toc.getRangeByIndexes(1, 4, 12, 4).clear(ExcelScript.ClearApplyTo.all);
+    // ── Clear old data table area: F2 down 12 rows (header + 10 + buffer) ──
+    toc.getRangeByIndexes(1, 5, 12, 4).clear(ExcelScript.ClearApplyTo.all);
 
-    // ── Write header row at E2 (row index 1, col index 4) ────────
-    const hdr = toc.getRangeByIndexes(1, 4, 1, 4);
+    // ── Write header row at F2 (row index 1, col index 5) ────────
+    const hdr = toc.getRangeByIndexes(1, 5, 1, 4);
     hdr.setValues([["Sprint", "Committed", "Done", "Completion %"]]);
     hdr.getFormat().getFill().setColor("#2F5496");
     hdr.getFormat().getFont().setBold(true);
@@ -347,22 +350,22 @@ function updateVelocityChart(
         const pct = d.committed > 0 ? d.done / d.committed : 0;
         return [String(s), d.committed, d.done, pct];
     });
-    toc.getRangeByIndexes(2, 4, tableRows.length, 4)
+    toc.getRangeByIndexes(2, 5, tableRows.length, 4)
         .setValues(tableRows as (string | number | boolean)[][]);
 
-    // Format Completion % column (H) as percentage
-    toc.getRangeByIndexes(2, 7, tableRows.length, 1).setNumberFormatLocal("0%");
+    // Format Completion % column (I) as percentage
+    toc.getRangeByIndexes(2, 8, tableRows.length, 1).setNumberFormatLocal("0%");
 
-    // Autofit E–H columns to their content
-    toc.getRangeByIndexes(1, 4, tableRows.length + 1, 4).getFormat().autofitColumns();
+    // Autofit F–I columns to their content
+    toc.getRangeByIndexes(1, 5, tableRows.length + 1, 4).getFormat().autofitColumns();
 
     // ── Create chart anchored below the data table ────────────────
-    // Chart range is F–H only (Committed, Done, Completion %) so the
-    // Sprint column (E) cannot be misread as a data series by Excel.
+    // Chart range is G–I only (Committed, Done, Completion %) so the
+    // Sprint column (F) cannot be misread as a data series by Excel.
     // Sprint numbers are wired in as category labels via setXAxisValues.
-    const seriesDataRange  = toc.getRangeByIndexes(1, 5, tableRows.length + 1, 3);
-    const sprintLabelRange = toc.getRangeByIndexes(2, 4, tableRows.length, 1);
-    const anchorCell       = toc.getRangeByIndexes(2 + tableRows.length + 1, 4, 1, 1);
+    const seriesDataRange = toc.getRangeByIndexes(1, 6, tableRows.length + 1, 3);
+    const sprintLabelRange = toc.getRangeByIndexes(2, 5, tableRows.length, 1);
+    const anchorCell = toc.getRangeByIndexes(2 + tableRows.length + 1, 5, 1, 1);
 
     const chart = toc.addChart(
         ExcelScript.ChartType.columnClustered,
@@ -386,8 +389,8 @@ function updateVelocityChart(
     allSeries[2].setXAxisValues(sprintLabelRange);
 
     const seriesCommitted = allSeries[0];
-    const seriesDone      = allSeries[1];
-    const seriesPct       = allSeries[2];
+    const seriesDone = allSeries[1];
+    const seriesPct = allSeries[2];
 
     seriesCommitted.getFormat().getFill().setSolidColor("#4472C4"); // blue bars
     seriesDone.getFormat().getFill().setSolidColor("#ED7D31");      // orange bars
@@ -448,7 +451,14 @@ function updateTOC(
     const today = new Date();
     const dateStr = `${today.getMonth() + 1}/${today.getDate()}/${today.getFullYear()}`;
 
-    // ── One-time setup: write title + headers if A1 is empty ────
+    // H:MM AM/PM  e.g.  2:07 PM
+    const rawHour = today.getHours();
+    const ampm = rawHour >= 12 ? "PM" : "AM";
+    const hour12 = rawHour % 12 || 12;
+    const minutes = String(today.getMinutes()).padStart(2, "0");
+    const timeStr = `${hour12}:${minutes} ${ampm}`;
+
+    // ── One-time setup: write title if A1 is empty ──────────────
     const a1Val = String(toc.getRange("A1").getValue()).trim();
     if (a1Val === "") {
         const title = toc.getRange("A1");
@@ -456,13 +466,14 @@ function updateTOC(
         title.getFormat().getFont().setBold(true);
         title.getFormat().getFont().setSize(16);
         title.getFormat().getFont().setColor("#1F3864");
-
-        const hdr = toc.getRange("A2:B2");
-        hdr.setValues([["Sprint", "Date Generated"]]);
-        hdr.getFormat().getFill().setColor("#2F5496");
-        hdr.getFormat().getFont().setBold(true);
-        hdr.getFormat().getFont().setColor("#FFFFFF");
     }
+
+    // ── Always refresh header row so new columns appear on existing sheets ──
+    const hdr = toc.getRange("A2:C2");
+    hdr.setValues([["Sprint", "Date Generated", "Time Generated"]]);
+    hdr.getFormat().getFill().setColor("#2F5496");
+    hdr.getFormat().getFont().setBold(true);
+    hdr.getFormat().getFont().setColor("#FFFFFF");
 
     // ── Batch-read column A rows 3–202 to find existing entry ───
     //    (one API call instead of looping per cell)
@@ -498,8 +509,9 @@ function updateTOC(
     nameCell.getFormat().getFont().setColor("#0563C1");
     nameCell.getFormat().getFont().setUnderline(ExcelScript.RangeUnderlineStyle.single);
 
-    // ── Date cell ────────────────────────────────────────────────
+    // ── Date + Time cells ────────────────────────────────────────
     toc.getRangeByIndexes(writeRow, 1, 1, 1).setValue(dateStr);
+    toc.getRangeByIndexes(writeRow, 2, 1, 1).setValue(timeStr);
 
     // ── Autofit ──────────────────────────────────────────────────
     toc.getUsedRange().getFormat().autofitColumns();
