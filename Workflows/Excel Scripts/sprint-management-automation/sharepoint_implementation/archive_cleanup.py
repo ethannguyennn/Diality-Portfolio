@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 from requests.auth import HTTPBasicAuth
 
 from config import ARCHIVE_PATH, LOG_FORMAT, LOG_LEVEL, LOG_RETENTION_DAYS, LOGS_DIR
+from jira_client import _sprint_num, parse_date
 from sharepoint_helper import SharePointHelper
 
 load_dotenv()
@@ -53,20 +54,14 @@ FILE_DATE_RE = re.compile(r'_(\d{8})')
 SPRINT_FOLDER_RE = re.compile(r'^Sprint (\d+)$')
 
 
-def _sprint_num(name: str):
-    m = re.search(r'(\d+)', name or "")
-    return int(m.group(1)) if m else None
-
-
 def _parse_jira_date(date_str):
-    if not date_str:
-        return None
-    date_str = date_str.replace("Z", "+00:00")
-    date_str = re.sub(r'([+-])(\d{2})(\d{2})$', r'\1\2:\3', date_str)
+    # Wrap jira_client.parse_date to return just the date, or None on a
+    # malformed string (a bad Jira date here should skip, not crash).
     try:
-        return datetime.fromisoformat(date_str).date()
+        dt = parse_date(date_str)
     except ValueError:
         return None
+    return dt.date() if dt else None
 
 
 def _fetch_jira_sprints(board_id: int) -> dict:
@@ -91,7 +86,7 @@ def _fetch_jira_sprints(board_id: int) -> dict:
         values = data.get("values", [])
         for sprint in values:
             num = _sprint_num(sprint.get("name", ""))
-            if num is None:
+            if num < 0:  # no number in the sprint name
                 continue
             start = _parse_jira_date(sprint.get("startDate"))
             end = _parse_jira_date(sprint.get("completeDate") or sprint.get("endDate"))
