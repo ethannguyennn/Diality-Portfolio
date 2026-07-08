@@ -3,13 +3,11 @@
 import logging
 import os
 from datetime import datetime
-from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
 import requests
 from dotenv import load_dotenv
-from openpyxl import load_workbook
 
 from config import (
     AUTH_ENDPOINT,
@@ -321,38 +319,4 @@ class SharePointHelper:
         except Exception as e:
             logger.error(f"Archive failed for {file_path}: {e}")
             raise SharePointOperationError(f"Archive failed: {e}")
-
-    # ── Convenience wrappers ──
-
-    def load_workbook(self, file_path: str, keep_vba: bool = None):
-        """Load an openpyxl Workbook from SharePoint."""
-        if keep_vba is None:
-            keep_vba = file_path.lower().endswith('.xlsm')
-        wb_bytes = self.read_excel(file_path)
-        return load_workbook(BytesIO(wb_bytes), keep_vba=keep_vba)
-
-    def save_workbook(self, file_path: str, workbook) -> None:
-        """Save an openpyxl Workbook back to SharePoint."""
-        buf = BytesIO()
-        workbook.save(buf)
-        self.write_excel(file_path, buf.getvalue())
-
-    def read_excel_to_dataframe(self, file_path: str):
-        """Read SharePoint Excel file into a pandas DataFrame."""
-        try:
-            import pandas as pd
-        except ImportError:
-            raise SharePointOperationError("pandas not installed")
-        content = self.read_excel(file_path)
-        return pd.read_excel(BytesIO(content))
-
-    def write_dataframe_to_excel(self, df, file_path: str) -> None:
-        """Write a pandas DataFrame as Excel to SharePoint."""
-        try:
-            import pandas as pd
-        except ImportError:
-            raise SharePointOperationError("pandas not installed")
-        buf = BytesIO()
-        df.to_excel(buf, index=False, engine="openpyxl")
-        self.write_excel(file_path, buf.getvalue())
 
