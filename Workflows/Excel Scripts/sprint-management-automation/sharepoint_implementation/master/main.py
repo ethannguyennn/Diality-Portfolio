@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 from config import (
     ARCHIVE_PATH, LOG_FORMAT, LOG_LEVEL, LOG_RETENTION_DAYS, LOGS_DIR,
-    SHAREPOINT_SYNC_PATH, SPRINT_TEMPLATE_FILE,
+    SPRINT_TEMPLATE_FILE,
 )
 from jira_client import get_jira_issues
 from sharepoint_helper import SharePointHelper
@@ -51,16 +51,11 @@ def main():
         logger.info(f"Archived to: {archive_path}")
 
         item_id = helper.get_item_id(SPRINT_TEMPLATE_FILE)
-        if SHAREPOINT_SYNC_PATH == SPRINT_TEMPLATE_FILE:
-            sync_item_id = item_id
-        else:
-            sync_item_id = helper.get_item_id(SHAREPOINT_SYNC_PATH)
 
         logger.info("Updating Sprint Template via Workbook API...")
         session_id = helper.open_workbook_session(item_id)
         try:
-            current_sprint_num = update_via_workbook(
-                helper, item_id, session_id, issues, sync_item_id)
+            current_sprint_num = update_via_workbook(helper, item_id, session_id, issues)
         except Exception:
             logger.exception("Failed updating Sprint Template via Workbook API")
             raise
