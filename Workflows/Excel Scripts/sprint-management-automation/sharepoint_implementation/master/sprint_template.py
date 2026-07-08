@@ -38,30 +38,6 @@ def _extract_key(label):
     return m.group(1) if m else None
 
 
-def _build_sync_index(sync_grid):
-    """Index the sync file's grid as (ticket_key, sprint_num) -> {'J': val, 'K': val}.
-
-    The sync file is the team's hand-maintained source of truth for the
-    Prediction (J) and Status Note / Justification (K) columns.
-    """
-    idx = {}
-    for r in range(DATA_START_ROW, len(sync_grid) + 1):
-        sn = _norm_sprint(_gv(sync_grid, r, 1))
-        if sn is None:
-            continue
-        key = _extract_key(_gv(sync_grid, r, 8))
-        if not key:
-            continue
-        idx[(key, sn)] = {"J": _gv(sync_grid, r, 10), "K": _gv(sync_grid, r, 11)}
-    return idx
-
-
-def _sync_note_for(sync_idx, key, sprint_num, field):
-    """Return the sync file's J or K value for exactly (key, sprint_num), or None."""
-    entry = sync_idx.get((key, sprint_num))
-    return entry.get(field) if entry else None
-
-
 def _strip_jira_suffix(k_val):
     """Remove the ' Jira: ...' tail this script appends, leaving only the human-authored portion."""
     if not k_val:
@@ -102,16 +78,13 @@ def _hyperlink_formula(label):
     return f'=HYPERLINK("{BASE_URL}/browse/{key}","{lbl}")'
 
 
-def update_via_workbook(helper, item_id, session_id, issues, sync_item_id):
+def update_via_workbook(helper, item_id, session_id, issues):
     """Incrementally update the Sprint Template sheet via the Workbook API.
 
     Reads the live sheet grid, reconciles it against current Jira state
     for the active and next sprints, then writes all changes (values,
     HYPERLINK formulas, and font/alignment formatting) in a single
     atomic pass.  Returns the current sprint number.
-
-    sync_item_id identifies the hand-maintained sync file that J/K notes
-    are sourced from; pass the same value as item_id if they're the same file.
     """
 
     def wb(method, rel, body=None):
@@ -124,23 +97,6 @@ def update_via_workbook(helper, item_id, session_id, issues, sync_item_id):
     grid = used.get("values", [])
     total_rows = used.get("rowCount", len(grid))
     logger.info(f"Grid read: address={used.get('address')}, rowCount={total_rows}")
-
-    # ── Read the sync file's grid (source of truth for J/K notes) ──
-    if sync_item_id == item_id:
-        logger.info("Sync file is the same as the template file; reusing the loaded grid")
-        sync_grid = grid
-    else:
-        logger.info("Reading sync file grid for J/K note lookup")
-        sync_session_id = helper.open_workbook_session(sync_item_id, persist=False)
-        try:
-            sync_used = helper.workbook_request(
-                "GET", sync_item_id, sync_session_id, f"{_WS}/usedRange?$select=values,rowCount")
-            sync_grid = sync_used.get("values", [])
-        finally:
-            helper.close_workbook_session(sync_item_id, sync_session_id)
-        logger.info(f"Sync file grid read: {len(sync_grid)} rows")
-    sync_idx = _build_sync_index(sync_grid)
-    logger.info(f"Built sync index: {len(sync_idx)} (ticket, sprint) entries")
 
     # Find last row with actual data in A..I
     last_data_row = DATA_START_ROW - 1
@@ -238,12 +194,9 @@ def update_via_workbook(helper, item_id, session_id, issues, sync_item_id):
                 cells[:9] = a_to_i
                 cells[9] = first["cells"][9]   # preserve J (employee-maintained)
                 cells[11] = first["cells"][11]  # preserve L (manual note)
-                if sync_item_id == item_id:
-                    # Sync source is the template itself — strip the old Jira suffix we
-                    # wrote last run so we don't compound "Jira: x Jira: x" each run.
-                    base_k = _strip_jira_suffix(first["cells"][10])
-                else:
-                    base_k = _sync_note_for(sync_idx, composite[0], sn, "K")
+                # K is hand-maintained too — strip the old Jira suffix we wrote
+                # last run so we don't compound "Jira: x Jira: x" each run.
+                base_k = _strip_jira_suffix(first["cells"][10])
                 cells[10] = _build_k(base_k, api_map[composite].get("jira_note"))
                 final[sn].append(cells)
                 updated += 1
@@ -267,8 +220,7 @@ def update_via_workbook(helper, item_id, session_id, issues, sync_item_id):
         cells = [None] * NUM_COLS
         cells[:9] = a_to_i
         # J (index 9) left as None — new row starts blank, employees fill it in
-        base_k = None if sync_item_id == item_id else _sync_note_for(sync_idx, composite[0], sn, "K")
-        cells[10] = _build_k(base_k, api_map[composite].get("jira_note"))
+        cells[10] = _build_k(None, api_map[composite].get("jira_note"))
         final[sn].append(cells)
 
     # Sort each sprint block by team then assignee
