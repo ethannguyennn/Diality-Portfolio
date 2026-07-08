@@ -3,7 +3,7 @@
 import logging
 import time
 
-from grid_utils import _gv, _norm_sprint
+from grid_utils import _col_letter, _gv, _norm_sprint
 from sharepoint_helper import SharePointOperationError
 from sprint_template import SHEET_NAME
 
@@ -29,15 +29,6 @@ SUMMARY_DONE_ALIASES = [
 # (type), T..AP (person).
 _SUMMARY_PCT_COL_BLOCKS = ((9, 12), (14, 18), (20, 42))
 SUMMARY_COMPLETE_FILL = "#92D050"
-
-
-def _col_letter(n: int) -> str:
-    """Convert a 1-based column index to its spreadsheet letter (1 -> A, 27 -> AA)."""
-    letters = ""
-    while n > 0:
-        n, rem = divmod(n - 1, 26)
-        letters = chr(ord('A') + rem) + letters
-    return letters
 
 
 def _f_scope_count(col_letter, r):
