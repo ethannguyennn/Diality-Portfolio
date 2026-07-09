@@ -1,536 +1,399 @@
-"""Build a Suspect Report sheet inside the live Sprint Management workbook
-from a JAMA suspect report (JSON).
-
-Writes flat rows -- no native Excel row grouping, since the Graph
-Workbook API doesn't expose that action -- into the "Suspect Report"
-sheet of SPRINT_TEMPLATE_FILE, via the same safe, co-authoring-friendly
-workbook-session API pattern update_sprint.py uses. Column A carries
-each row's intended outline level (1/2/3, blank for category rows); a
-companion VBA macro (suspect.vba) reads that column to build real
-collapsible grouping client-side the moment anyone opens the sheet,
-since row grouping is an Excel-only feature the REST API can't create.
-
-The whole sheet's content (columns A-F) is cleared and rewritten from
-scratch every run. A fresh timestamp is stamped into the build-marker
-cell (O1) each run so the companion macro knows new data has landed and
-it needs to regroup -- see suspect.vba for the other half of this.
-
-The expected JSON layout is::
-
-    {
-      "Summary": {"PRS": {"Total Items": <int>, ...}, ...},
-      "Suspect Relation Counts": {"PRS": <int>, ...},
-      "Modules": {
-        "PRS": {
-          "<Category>": {
-            "<Item ID>": {
-              "ID": <int>,
-              "Upstream Suspects": {"<Upstream ID>": <int>, ...}
-            }
-          }
-        }
-      },
-      "Generated At": "<str>",
-      "Project ID": <int>
-    }
-
-Usage::
-
-    python suspect.py <input.json>
+"""Sprint Template sheet update (incremental, co-authoring safe) and the
+sprint filter applied on top of it.
 """
+
+import logging
 import re
-import json
-import sys
-import time
-from datetime import datetime, timezone
+from datetime import datetime
 
-from dotenv import load_dotenv
+from grid_utils import _gv, _norm_sprint
+from jira_client import (
+    BASE_URL, MIN_SPRINT, MOVED_OUT, _adf_to_text, _original_assignee_for_sprint,
+    _sprint_num, _sprint_started, get_sprint_history, get_status, get_type,
+)
+from roster import _SYS_TEAM_IDX, _assignee_nickname, _team_for_nickname
+from sharepoint_helper import SharePointOperationError
 
-sys.path.insert(0, r"c:\Scripts\Leahi Sprint Management Scripts\OOP")
+logger = logging.getLogger(__name__)
 
-from config import SPRINT_TEMPLATE_FILE
-from sharepoint_helper import SharePointHelper, SharePointOperationError
+# ── Sheet layout ──
+SHEET_NAME = "Sprint Template"
+DATA_START_ROW = 4
+NUM_COLS = 12
 
-load_dotenv(r"c:\Scripts\Leahi Sprint Management Scripts\leahi-sprint-management\.env")
-
-MODULE_ORDER = ('PRS', 'SRS', 'LVTC')
-SHEET_NAME = 'Suspect Report'
-HEADER_ROW = 3
-DATA_START_ROW = HEADER_ROW + 1
-
-LEVEL_MODULE = 1
-LEVEL_ITEM = 2
-LEVEL_SUSPECT = 3
-
-# Marker cells the companion VBA macro (suspect.vba) reads to decide
-# whether it needs to (re)build grouping. Python always stamps a fresh
-# BUILD_MARKER value here on every run; the macro only regroups when
-# that differs from what it last grouped (which it stores in the
-# grouped-marker cell -- Python never touches that one). LAST_TREE_ROW
-# tells the macro exactly where the tree ends and the always-visible
-# Module Summary block begins, since column A alone can't reliably
-# convey that boundary (it's blank for both category rows and the
-# entire summary block).
-MARKER_LABEL_CELL = 'N1'
-BUILD_MARKER_CELL = 'O1'
-GROUPED_LABEL_CELL = 'N2'
-GROUPED_MARKER_CELL = 'O2'
-LAST_TREE_ROW_LABEL_CELL = 'N3'
-LAST_TREE_ROW_CELL = 'O3'
-
-# Style specs per row "kind": fill color, font, and column extent
-# (1-based start/end column) the fill+font apply across, plus one or
-# more (start_col, end_col, horizontal_align, indent) alignment specs.
-# NOTE: the Graph API's workbookRangeFormat has no working "indent"
-# property (confirmed empirically -- a PATCH with "indentLevel" is
-# silently accepted but never actually applied, and isn't even a real
-# selectable property). Hierarchy indentation is done with leading
-# spaces baked directly into the label text instead -- see INDENT_SPACES.
-STYLES = {
-    'header': {
-        'fill': 'FFC000', 'font': {'bold': True, 'size': 10, 'color': 'FFFFFF'},
-        'extent': (2, 4),
-        'aligns': [(2, 2, 'Left'), (3, 4, 'Center')],
-    },
-    'category': {
-        'fill': '107C41', 'font': {'bold': True, 'size': 11, 'color': 'FFFFFF'},
-        'extent': (2, 4),
-        'aligns': [(2, 2, 'Left'), (3, 4, 'Center')],
-    },
-    'module': {
-        'fill': '70AD47', 'font': {'bold': True, 'size': 10, 'color': 'FFFFFF'},
-        'extent': (2, 4),
-        'aligns': [(2, 2, 'Left'), (3, 4, 'Center')],
-    },
-    'item': {
-        'fill': 'A9D08E', 'font': {'bold': True, 'size': 10, 'color': '000000'},
-        'extent': (2, 4),
-        'aligns': [(2, 2, 'Left'), (3, 4, 'Center')],
-    },
-    'suspect': {
-        'fill': 'E2EFDA', 'font': {'bold': False, 'size': 10, 'color': '000000'},
-        'extent': (2, 4),
-        'aligns': [(2, 2, 'Left'), (3, 4, 'Center')],
-    },
-    'summary_header': {
-        'fill': '70AD47', 'font': {'bold': True, 'size': 11, 'color': 'FFFFFF'},
-        'extent': (2, 6),
-        'aligns': [(2, 6, 'Center')],
-    },
-    'summary_title': {
-        'fill': '107C41', 'font': {'bold': True, 'size': 16, 'color': 'FFFFFF'},
-        'extent': (2, 6),
-        'aligns': [(2, 6, 'Left')],
-    },
-    'summary_data': {
-        'fill': None, 'font': {'bold': False, 'size': 11, 'color': '000000'},
-        'extent': (2, 6),
-        'aligns': [(2, 2, 'Left'), (3, 6, 'Center')],
-    },
-    'summary_total': {
-        'fill': 'A9D08E', 'font': {'bold': True, 'size': 11, 'color': '000000'},
-        'extent': (2, 6),
-        'aligns': [(2, 2, 'Left'), (3, 6, 'Center')],
-    },
+# ── Type font colors ──
+TYPE_FONT_COLORS = {
+    "Bug": "FF0000", "Dialin ticket": "4472C4",
+    "Support": "00B050", "Little-V": "7030A0", "Big-V": "000000",
 }
 
-# Leading spaces baked into column-B label text to simulate indentation
-# per tree level, since the API has no real cell-indent property.
-INDENT_SPACES = {
-    'category': '',
-    'module': '   ',
-    'item': '      ',
-    'suspect': '         ',
-}
-
-# A tree this size needs ~2500 sequential Graph API calls to style, which
-# runs long enough that a transient Gateway Timeout / Service Unavailable
-# is a real occurrence, not a hypothetical -- retry those instead of
-# aborting the whole run over one flaky request.
-_TRANSIENT_ERROR_MARKERS = ('502', '503', '504', 'Gateway Timeout', 'Service Unavailable', 'Bad Gateway')
-_MAX_RETRIES = 5
-_COL_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+# ── Workbook API constants ──
+_WS = f"worksheets('{SHEET_NAME}')"
+_LAST_COL = chr(ord('A') + NUM_COLS - 1)  # 'L'
 
 
-class SuspectReportError(Exception):
-    """Raised when the input report is malformed or inconsistent."""
+def _extract_key(label):
+    # Extract the Jira issue key from a '[KEY] summary' label string.
+    m = re.match(r'\[([A-Z]+-\d+)\]', str(label) if label is not None else '')
+    return m.group(1) if m else None
 
 
-def natural_key(text):
-    """Return a natural-sort key so 'ID-9' sorts before 'ID-10'."""
-    parts = re.split(r'(\d+)', text)
-    return [int(tok) if tok.isdigit() else tok for tok in parts]
+def _strip_jira_suffix(k_val):
+    """Remove the ' Jira: ...' tail this script appends, leaving only the human-authored portion."""
+    if not k_val:
+        return None
+    stripped = re.sub(r'\s*Jira:.*$', '', str(k_val), flags=re.DOTALL).strip()
+    return stripped or None
 
 
-def load_report(json_path):
-    """Load and return the report dictionary from a JSON file."""
-    with open(json_path, encoding='utf-8') as handle:
-        return json.load(handle)
+def _build_k(base_k, jira_note):
+    """Combine an optional human base note with an optional Jira note into a K cell value."""
+    if jira_note is not None:
+        return f"{base_k} Jira: {jira_note}".strip() if base_k else f"Jira: {jira_note}"
+    return base_k or ""
 
 
-def _is_category_mapping(candidate):
-    """Return True if candidate maps categories to item groups.
+def _issue_row_cells(record):
+    """Build the A..I values list for a Jira record."""
+    issue = record["issue"]
+    fields = issue["fields"]
+    key = issue["key"]
+    current_assignee = _assignee_nickname(
+        fields["assignee"]["displayName"] if fields.get("assignee") else "")
+    original_assignee = record.get("original_assignee") or current_assignee
+    issue_type = get_type(issue)
+    label = f"[{key}] {fields.get('summary', '')}"
+    has_desc = "Y" if len(_adf_to_text(fields.get("description") or "")) > 20 else "N"
+    status = get_status(issue, issue_type)
+    return [record["sprint_num"], record.get("team"), original_assignee,
+            current_assignee, issue_type, record["scope"], has_desc, label, status]
 
-    A category group maps item IDs to item objects, so every value is a
-    dict.  A bare item entry (old flat format) has scalar values such as
-    the numeric 'ID', which distinguishes the two layouts.
+
+def _hyperlink_formula(label):
+    """Build =HYPERLINK(url, label) from a '[KEY] summary' label."""
+    key = _extract_key(label)
+    if not key:
+        return str(label) if label is not None else ""
+    lbl = str(label).replace('"', '""').replace('\n', ' ').replace('\r', '')
+    return f'=HYPERLINK("{BASE_URL}/browse/{key}","{lbl}")'
+
+
+def update_via_workbook(helper, item_id, session_id, issues):
+    """Incrementally update the Sprint Template sheet via the Workbook API.
+
+    Reads the live sheet grid, reconciles it against current Jira state
+    for the active and next sprints, then writes all changes (values,
+    HYPERLINK formulas, and font/alignment formatting) in a single
+    atomic pass.  Returns the current sprint number.
     """
-    if not isinstance(candidate, dict):
-        return False
-    for value in candidate.values():
-        if not isinstance(value, dict):
-            return False
-    return True
-
-
-def build_tree(report):
-    """Return a nested tree of category -> module -> items.
-
-    The returned structure is a list of tuples::
-
-        (category, [(module, [(item_id, item_num, [(up_id, up_num)])])])
-
-    Categories are sorted alphabetically; modules follow MODULE_ORDER;
-    items are natural-sorted; suspect links keep their source order.
-    """
-    modules = report.get('Modules')
-    if not isinstance(modules, dict):
-        raise SuspectReportError("Report is missing a 'Modules' object.")
-
-    # category -> module -> {item_id: (item_num, [(up_id, up_num), ...])}
-    catalog = {}
-    for module in modules:
-        categories = modules[module]
-        for category, items in categories.items():
-            if not _is_category_mapping(items):
-                raise SuspectReportError(
-                    f"Module '{module}' is not organized by category. "
-                    "This script expects Modules -> Module -> Category "
-                    "-> Item. Use the by-category report format.")
-            for item_id, info in items.items():
-                links = list(info.get('Upstream Suspects', {}).items())
-                catalog.setdefault(category, {}).setdefault(
-                    module, {})[item_id] = (info.get('ID'), links)
-
-    module_rank = {name: pos for pos, name in enumerate(MODULE_ORDER)}
-    tree = []
-    for category in sorted(catalog):
-        module_map = catalog[category]
-        module_names = sorted(
-            module_map, key=lambda m: module_rank.get(m, len(module_rank)))
-        module_rows = []
-        for module in module_names:
-            item_map = module_map[module]
-            item_rows = []
-            for item_id in sorted(item_map, key=natural_key):
-                item_num, links = item_map[item_id]
-                item_rows.append((item_id, item_num, links))
-            module_rows.append((module, item_rows))
-        tree.append((category, module_rows))
-    return tree
-
-
-def _count_links(module_rows):
-    """Return total suspect links across every item in a module list."""
-    return sum(
-        len(links)
-        for _module, item_rows in module_rows
-        for _item_id, _item_num, links in item_rows)
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  Row plan: pure data -> (matrix, row_kind, row_level), no I/O
-# ═══════════════════════════════════════════════════════════════════
-
-def _plan_tree_rows(tree, matrix, row_kind, row_level):
-    """Fill matrix/row_kind/row_level for the tree portion. Returns last row used."""
-    row = DATA_START_ROW
-    for category, module_rows in tree:
-        matrix.setdefault(row, {})[2] = INDENT_SPACES['category'] + category
-        matrix.setdefault(row, {})[4] = _count_links(module_rows)
-        row_kind[row] = 'category'
-        row += 1
-
-        for module, item_rows in module_rows:
-            module_links = sum(len(links) for _i, _n, links in item_rows)
-            matrix.setdefault(row, {})[2] = INDENT_SPACES['module'] + module
-            matrix.setdefault(row, {})[4] = module_links
-            row_kind[row] = 'module'
-            row_level[row] = LEVEL_MODULE
-            row += 1
-
-            for item_id, item_num, links in item_rows:
-                matrix.setdefault(row, {})[2] = INDENT_SPACES['item'] + item_id
-                matrix.setdefault(row, {})[3] = item_num
-                matrix.setdefault(row, {})[4] = len(links)
-                row_kind[row] = 'item'
-                row_level[row] = LEVEL_ITEM
-                row += 1
-
-                for up_id, up_num in links:
-                    matrix.setdefault(row, {})[2] = INDENT_SPACES['suspect'] + up_id
-                    matrix.setdefault(row, {})[3] = up_num
-                    row_kind[row] = 'suspect'
-                    row_level[row] = LEVEL_SUSPECT
-                    row += 1
-
-    return row - 1
-
-
-def _plan_summary_rows(report, start_row, matrix, row_kind):
-    """Fill matrix/row_kind for the module summary block. Returns (title_row, total_row)."""
-    title_row = start_row
-    matrix.setdefault(title_row, {})[2] = 'Module Summary'
-    row_kind[title_row] = 'summary_title'
-
-    header_row = title_row + 2
-    headers = ('Module', 'Total Items', 'Items With Suspects',
-               'Suspect Relations', 'Impacted Items')
-    for offset, label in enumerate(headers):
-        matrix.setdefault(header_row, {})[2 + offset] = label
-    row_kind[header_row] = 'summary_header'
-
-    summary = report.get('Summary', {})
-    module_names = [m for m in MODULE_ORDER if m in summary]
-    module_names += [m for m in summary if m not in MODULE_ORDER]
-
-    row = header_row + 1
-    column_totals = [0, 0, 0, 0]
-    for module in module_names:
-        stats = summary[module]
-        matrix.setdefault(row, {})[2] = module
-        values = (
-            stats.get('Total Items'),
-            stats.get('Items With Suspects'),
-            stats.get('Suspect Relations'),
-            stats.get('Impacted Items Count'),
-        )
-        for offset, value in enumerate(values):
-            matrix.setdefault(row, {})[3 + offset] = value
-            column_totals[offset] += value or 0
-        row_kind[row] = 'summary_data'
-        row += 1
-
-    total_row = row
-    matrix.setdefault(total_row, {})[2] = 'Total'
-    for offset, total in enumerate(column_totals):
-        matrix.setdefault(total_row, {})[3 + offset] = total
-    row_kind[total_row] = 'summary_total'
-
-    return title_row, total_row
-
-
-def build_row_plan(report, tree):
-    """Return (last_row, matrix, row_kind, row_level, summary_title_row, last_tree_row).
-
-    matrix is {row: {col: value}} for columns B-F (1-based col index).
-    row_kind maps row -> style key (see STYLES). row_level maps row ->
-    the outline level to stamp in column A (only set for tree rows below
-    the always-visible category level). summary_title_row is the row
-    the "Module Summary" banner needs merged across B:F. last_tree_row is
-    the last row belonging to the tree itself, before the summary block.
-    """
-    matrix = {}
-    row_kind = {}
-    row_level = {}
-
-    relation_counts = report.get('Suspect Relation Counts', {})
-    counts_text = ' / '.join(
-        f'{name} {relation_counts.get(name, 0)}'
-        for name in MODULE_ORDER if name in relation_counts)
-    matrix.setdefault(1, {})[2] = 'LEAHI - Upstream Suspect Links by Category'
-    matrix.setdefault(2, {})[2] = (
-        f"Project ID: {report.get('Project ID', '')}     "
-        f"Generated: {report.get('Generated At', '')}     "
-        f"Suspect links: {counts_text}")
-
-    headers = ('Category / Module / Item / Suspect', 'Numeric ID', 'Suspect Links')
-    for offset, label in enumerate(headers):
-        matrix.setdefault(HEADER_ROW, {})[2 + offset] = label
-    row_kind[HEADER_ROW] = 'header'
-
-    last_tree_row = _plan_tree_rows(tree, matrix, row_kind, row_level)
-    summary_title_row, _summary_total_row = _plan_summary_rows(
-        report, last_tree_row + 2, matrix, row_kind)
-
-    last_row = max(matrix)
-    return last_row, matrix, row_kind, row_level, summary_title_row, last_tree_row
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  Graph API write: turns the plan into workbook-session calls
-# ═══════════════════════════════════════════════════════════════════
-
-def _col_letter(n):
-    return _COL_LETTERS[n - 1]
-
-
-def _iter_runs(row_kind, last_row):
-    """Yield (start_row, end_row, kind) for maximal contiguous same-kind runs."""
-    r = HEADER_ROW
-    while r <= last_row:
-        kind = row_kind.get(r)
-        if kind is None:
-            r += 1
-            continue
-        start = r
-        while r + 1 <= last_row and row_kind.get(r + 1) == kind:
-            r += 1
-        yield start, r, kind
-        r += 1
-
-
-def _ensure_sheet(wb):
-    sheets = wb('GET', 'worksheets')['value']
-    if not any(s['name'] == SHEET_NAME for s in sheets):
-        wb('POST', 'worksheets/add', {'name': SHEET_NAME})
-
-
-def _clear_sheet(wb, clear_through_row):
-    wb('POST', f"worksheets('{SHEET_NAME}')/range(address='A1:F{clear_through_row}')/clear",
-       {'applyTo': 'All'})
-
-
-def _write_values(wb, last_row, matrix):
-    values = []
-    for row in range(1, last_row + 1):
-        cells = matrix.get(row, {})
-        values.append([cells.get(col) for col in range(1, 7)])
-    wb('PATCH', f"worksheets('{SHEET_NAME}')/range(address='A1:F{last_row}')",
-       {'values': values})
-
-
-def _write_levels(wb, last_row, row_level):
-    values = [[row_level.get(row)] for row in range(DATA_START_ROW, last_row + 1)]
-    if any(v[0] is not None for v in values):
-        wb('PATCH', f"worksheets('{SHEET_NAME}')/range(address='A{DATA_START_ROW}:A{last_row}')",
-           {'values': values})
-
-
-def _apply_run_style(wb, start_row, end_row, kind):
-    style = STYLES[kind]
-    col_start, col_end = style['extent']
-    rng = f"{_col_letter(col_start)}{start_row}:{_col_letter(col_end)}{end_row}"
-
-    if style['fill'] is not None:
-        wb('PATCH', f"worksheets('{SHEET_NAME}')/range(address='{rng}')/format/fill",
-           {'color': f"#{style['fill']}"})
-    if style['font'] is not None:
-        wb('PATCH', f"worksheets('{SHEET_NAME}')/range(address='{rng}')/format/font",
-           style['font'])
-    for a_start, a_end, halign in style['aligns']:
-        a_rng = f"{_col_letter(a_start)}{start_row}:{_col_letter(a_end)}{end_row}"
-        wb('PATCH', f"worksheets('{SHEET_NAME}')/range(address='{a_rng}')/format",
-           {'horizontalAlignment': halign, 'verticalAlignment': 'Center'})
-
-
-def _write_banner(wb, report):
-    title_rng = "B1:D1"
-    wb('POST', f"worksheets('{SHEET_NAME}')/range(address='{title_rng}')/merge", {})
-    wb('PATCH', f"worksheets('{SHEET_NAME}')/range(address='{title_rng}')/format/fill",
-       {'color': '#107C41'})
-    wb('PATCH', f"worksheets('{SHEET_NAME}')/range(address='{title_rng}')/format/font",
-       {'bold': True, 'size': 16, 'color': 'FFFFFF'})
-    wb('PATCH', f"worksheets('{SHEET_NAME}')/range(address='{title_rng}')/format",
-       {'horizontalAlignment': 'Left', 'verticalAlignment': 'Center', 'rowHeight': 30})
-
-    subtitle_rng = "B2:D2"
-    wb('POST', f"worksheets('{SHEET_NAME}')/range(address='{subtitle_rng}')/merge", {})
-    wb('PATCH', f"worksheets('{SHEET_NAME}')/range(address='{subtitle_rng}')/format/font",
-       {'italic': True, 'size': 9, 'color': '666666'})
-    wb('PATCH', f"worksheets('{SHEET_NAME}')/range(address='{subtitle_rng}')/format",
-       {'horizontalAlignment': 'Left', 'verticalAlignment': 'Center', 'rowHeight': 18})
-
-
-def _write_summary_title_merge(wb, title_row):
-    rng = f"B{title_row}:F{title_row}"
-    wb('POST', f"worksheets('{SHEET_NAME}')/range(address='{rng}')/merge", {})
-
-
-def _set_column_widths(wb):
-    widths = {'A': 4, 'B': 52, 'C': 18, 'D': 16, 'E': 20, 'F': 20}
-    for col, width in widths.items():
-        try:
-            wb('PATCH', f"worksheets('{SHEET_NAME}')/range(address='{col}1:{col}1')/format",
-               {'columnWidth': width})
-        except SharePointOperationError:
-            pass  # cosmetic only
-
-
-def _write_build_marker(wb, last_tree_row):
-    marker = datetime.now(timezone.utc).isoformat()
-    wb('PATCH', f"worksheets('{SHEET_NAME}')/range(address='{MARKER_LABEL_CELL}:{BUILD_MARKER_CELL}')",
-       {'values': [['Build marker (do not edit):', marker]]})
-    wb('PATCH', f"worksheets('{SHEET_NAME}')/range(address='{LAST_TREE_ROW_LABEL_CELL}:{LAST_TREE_ROW_CELL}')",
-       {'values': [['Last tree row (do not edit):', last_tree_row]]})
-    return marker
-
-
-def write_suspect_report(helper, item_id, session_id, report, tree):
-    """Clear and rewrite the Suspect Report sheet from scratch."""
 
     def wb(method, rel, body=None):
-        for attempt in range(_MAX_RETRIES + 1):
-            try:
-                return helper.workbook_request(method, item_id, session_id, rel, body)
-            except SharePointOperationError as exc:
-                is_transient = any(marker in str(exc) for marker in _TRANSIENT_ERROR_MARKERS)
-                if not is_transient or attempt == _MAX_RETRIES:
-                    raise
-                wait = 2 ** attempt
-                print(f"  Transient error, retrying in {wait}s "
-                      f"(attempt {attempt + 1}/{_MAX_RETRIES})...")
-                time.sleep(wait)
+        # Dispatch a Workbook API request through the SharePoint helper.
+        return helper.workbook_request(method, item_id, session_id, rel, body)
 
-    _ensure_sheet(wb)
+    # ── Read the live grid ──
+    logger.info("Reading live sheet grid")
+    used = wb("GET", f"{_WS}/usedRange?$select=values,rowCount,address")
+    grid = used.get("values", [])
+    total_rows = used.get("rowCount", len(grid))
+    logger.info(f"Grid read: address={used.get('address')}, rowCount={total_rows}")
 
-    last_row, matrix, row_kind, row_level, summary_title_row, last_tree_row = \
-        build_row_plan(report, tree)
+    # Find last row with actual data in A..I
+    last_data_row = DATA_START_ROW - 1
+    for r in range(DATA_START_ROW, total_rows + 1):
+        if any(_gv(grid, r, c) is not None for c in range(1, 10)):
+            last_data_row = r
+    logger.debug(f"Last data row: {last_data_row}")
 
-    existing = wb('GET', f"worksheets('{SHEET_NAME}')/usedRange?$select=rowCount")
-    clear_through = max(last_row, existing.get('rowCount', 0), 200)
-    _clear_sheet(wb, clear_through)
+    # ── Sprint targets (from Jira) ──
+    active_sprint_nums = []
+    for issue in issues:
+        for s in (issue["fields"].get("customfield_10020") or []):
+            num = _sprint_num(s.get("name", ""))
+            if num >= MIN_SPRINT and s.get("state") == "active":
+                active_sprint_nums.append(num)
+    current_sprint_num = max(active_sprint_nums) if active_sprint_nums else MIN_SPRINT
+    if not active_sprint_nums:
+        b2 = _norm_sprint(_gv(grid, 2, 2))
+        if b2 and b2 >= MIN_SPRINT:
+            current_sprint_num = b2
+    next_sprint_num = current_sprint_num + 1
+    target_sprints = (current_sprint_num, next_sprint_num)
+    target_set = set(target_sprints)
+    logger.info(f"Target sprints: current={current_sprint_num}, next={next_sprint_num}")
 
-    _write_values(wb, last_row, matrix)
-    _write_levels(wb, last_row, row_level)
+    # ── Sprint object lookup ──
+    sprint_map = {}
+    for issue in issues:
+        for s in (issue["fields"].get("customfield_10020") or []):
+            num = _sprint_num(s.get("name", ""))
+            if num >= MIN_SPRINT and num not in sprint_map:
+                sprint_map[num] = s
 
-    for start_row, end_row, kind in _iter_runs(row_kind, last_row):
-        _apply_run_style(wb, start_row, end_row, kind)
+    # ── Build api_map (what Jira says should be in the sheet) ──
+    api_map, sys_excluded = {}, set()
+    for issue in issues:
+        for sprint_num, scope in get_sprint_history(issue, next_sprint_num):
+            if sprint_num not in target_set or scope == MOVED_OUT:
+                continue
+            composite = (issue["key"], sprint_num)
+            sprint_obj = next(
+                (s for s in (issue["fields"].get("customfield_10020") or [])
+                 if _sprint_num(s.get("name", "")) == sprint_num), None)
+            original_assignee = _original_assignee_for_sprint(issue, sprint_obj)
+            current_full = (issue["fields"]["assignee"]["displayName"]
+                            if issue["fields"].get("assignee") else "")
+            current_assignee = _assignee_nickname(current_full)
+            team_name, team_idx = _team_for_nickname(current_assignee)
+            if team_idx == _SYS_TEAM_IDX:
+                sys_excluded.add(composite)
+                continue
+            api_map[composite] = {
+                "issue": issue, "sprint_num": sprint_num, "scope": scope,
+                "jira_note": issue.get("_jira_note"),
+                "original_assignee": original_assignee, "team": team_name,
+            }
+    logger.info(f"Built api_map: {len(api_map)} active tickets, {len(sys_excluded)} SYS-excluded")
 
-    _write_banner(wb, report)
-    _write_summary_title_merge(wb, summary_title_row)
-    _set_column_widths(wb)
-    marker = _write_build_marker(wb, last_tree_row)
+    # ── Index existing target-sprint rows from the live grid ──
+    existing = {}  # (key, sprint) -> [{"row": int, "cells": list}, ...]
+    for r in range(DATA_START_ROW, last_data_row + 1):
+        sn = _norm_sprint(_gv(grid, r, 1))
+        key = _extract_key(_gv(grid, r, 8))
+        if key and sn in target_set:
+            cells = [_gv(grid, r, c) for c in range(1, NUM_COLS + 1)]
+            existing.setdefault((key, sn), []).append({"row": r, "cells": cells})
+    logger.info(f"Indexed {len(existing)} existing target-sprint rows from the sheet")
 
-    return last_row, marker
+    # Find the contiguous region of target-sprint rows
+    target_rows = [d["row"] for lst in existing.values() for d in lst]
+    if target_rows:
+        region_start = min(target_rows)
+        region_cur_n = last_data_row - region_start + 1
+    else:
+        region_start = last_data_row + 1
+        region_cur_n = 0
 
+    # ── Build the final row set ──
+    final = {sn: [] for sn in target_sprints}
+    handled = set()
+    updated = removed = deleted = 0
 
-def main(argv):
-    """Command-line entry point."""
-    if len(argv) < 2:
-        print('Usage: python suspect.py <input.json>')
-        return 1
+    for composite, lst in existing.items():
+        sn = composite[1]
+        first = lst[0]
+        cur_scope = first["cells"][5]  # col F (0-indexed)
 
-    input_path = argv[1]
+        if composite in api_map:
+            handled.add(composite)
+            if cur_scope == MOVED_OUT:
+                final[sn].append(list(first["cells"]))
+            else:
+                a_to_i = _issue_row_cells(api_map[composite])
+                cells = [None] * NUM_COLS
+                cells[:9] = a_to_i
+                cells[9] = first["cells"][9]   # preserve J (employee-maintained)
+                cells[11] = first["cells"][11]  # preserve L (manual note)
+                # K is hand-maintained too — strip the old Jira suffix we wrote
+                # last run so we don't compound "Jira: x Jira: x" each run.
+                base_k = _strip_jira_suffix(first["cells"][10])
+                cells[10] = _build_k(base_k, api_map[composite].get("jira_note"))
+                final[sn].append(cells)
+                updated += 1
+        else:
+            if composite in sys_excluded and cur_scope != MOVED_OUT:
+                deleted += 1
+                continue
+            if not _sprint_started(sn, sprint_map):
+                deleted += 1
+                continue
+            cells = list(first["cells"])
+            if cur_scope != MOVED_OUT:
+                cells[5] = MOVED_OUT
+                removed += 1
+            final[sn].append(cells)
 
+    new_composites = [c for c in api_map if c not in handled]
+    for composite in new_composites:
+        sn = composite[1]
+        a_to_i = _issue_row_cells(api_map[composite])
+        cells = [None] * NUM_COLS
+        cells[:9] = a_to_i
+        # J (index 9) left as None — new row starts blank, employees fill it in
+        cells[10] = _build_k(None, api_map[composite].get("jira_note"))
+        final[sn].append(cells)
+
+    # Sort each sprint block by team then assignee
+    def _sort_key(cells):
+        # Sort rows by team index, then alphabetically by original assignee name.
+        orig = cells[2]  # col C = original assignee
+        _, ti = _team_for_nickname(orig)
+        return (ti, orig or "")
+
+    final_rows = []
+    for sn in target_sprints:
+        final_rows.extend(sorted(final[sn], key=_sort_key))
+    fin_n = len(final_rows)
+    logger.info(
+        f"Final row set built: {fin_n} rows "
+        f"({updated} updated, {len(new_composites)} new, {removed} marked-removed, {deleted} deleted)"
+    )
+
+    # ── Reconcile row count: insert or delete rows as needed ──
+    delta = fin_n - region_cur_n
+    if delta > 0:
+        logger.info(f"Inserting {delta} row(s) at row {region_start + region_cur_n}")
+        ins_at = region_start + region_cur_n
+        try:
+            for _ in range(delta):
+                wb("POST", f"{_WS}/range(address='{ins_at}:{ins_at}')/insert",
+                   {"shift": "Down"})
+        except SharePointOperationError:
+            logger.error(f"Failed inserting rows at {ins_at}")
+            raise
+    elif delta < 0:
+        logger.info(f"Deleting {-delta} row(s) from {region_start + fin_n} to {region_start + region_cur_n - 1}")
+        del_start = region_start + fin_n
+        del_end = region_start + region_cur_n - 1
+        try:
+            for r in range(del_end, del_start - 1, -1):
+                wb("POST", f"{_WS}/range(address='{r}:{r}')/delete",
+                   {"shift": "Up"})
+        except SharePointOperationError:
+            logger.error(f"Failed deleting rows {del_start}-{del_end}")
+            raise
+
+    if fin_n == 0:
+        logger.info("No active rows for target sprints; nothing to write.")
+    else:
+        end_row = region_start + fin_n - 1
+
+        # ── Clear stale formatting first ──
+        # Row inserts (above) copy formatting from the adjacent row, so a
+        # manually-struck-through or otherwise formatted row can propagate
+        # its formatting onto brand-new rows forever, since nothing below
+        # resets properties (e.g. strikethrough) that aren't explicitly set.
+        # Wiping formats before reapplying our own guarantees a clean slate
+        # every run regardless of what the row was inserted next to.
+        logger.debug(f"Clearing stale formatting on A{region_start}:{_LAST_COL}{end_row}")
+        try:
+            wb("POST", f"{_WS}/range(address='A{region_start}:{_LAST_COL}{end_row}')/clear",
+               {"applyTo": "Formats"})
+        except SharePointOperationError:
+            logger.error(f"Failed clearing formatting on A{region_start}:{_LAST_COL}{end_row}")
+            raise
+
+        # ── Single atomic write: values + HYPERLINK formulas in col H ──
+        logger.info(f"Writing {fin_n} rows to A{region_start}:{_LAST_COL}{end_row}")
+        formulas_grid = []
+        for row in final_rows:
+            frow = list(row)
+            frow[1] = row[1] if row[1] is not None else ""   # B: team — write "" not None
+            frow[7] = _hyperlink_formula(row[7])
+            frow[9] = row[9] if row[9] is not None else ""   # J: clear stale on row shift
+            frow[11] = row[11] if row[11] is not None else "" # L: clear stale on row shift
+            formulas_grid.append(frow)
+        try:
+            wb("PATCH", f"{_WS}/range(address='A{region_start}:{_LAST_COL}{end_row}')",
+               {"formulas": formulas_grid})
+        except SharePointOperationError:
+            logger.error(f"Failed writing rows to A{region_start}:{_LAST_COL}{end_row}")
+            raise
+        logger.info("Row data written successfully")
+
+        # ── Force recalculation ──
+        # The Workbook API writes formula text but doesn't evaluate it
+        # server-side, so newly-written cells (e.g. col H's HYPERLINK)
+        # keep a stale cached value (0 for a fresh formula cell) until
+        # something recalculates them -- which also means the *next* run's
+        # usedRange read would see that stale 0 instead of the real label,
+        # breaking _extract_key's row matching. Force it now so both the
+        # display and the next run's grid read reflect the real formula
+        # results immediately.
+        try:
+            wb("POST", "application/calculate", {"calculationType": "Full"})
+        except SharePointOperationError:
+            logger.warning("Failed to force recalculation after writing rows")
+
+        # ── Formatting: type color on col E (batched by contiguous same-color runs) ──
+        logger.debug("Applying type color formatting to column E")
+        types = [row[4] for row in final_rows]
+        i = 0
+        try:
+            while i < fin_n:
+                color = TYPE_FONT_COLORS.get(types[i], "000000")
+                j = i
+                while j + 1 < fin_n and TYPE_FONT_COLORS.get(types[j + 1], "000000") == color:
+                    j += 1
+                r1, r2 = region_start + i, region_start + j
+                wb("PATCH", f"{_WS}/range(address='E{r1}:E{r2}')/format/font",
+                   {"color": f"#{color}"})
+                i = j + 1
+
+            # Col H: blue underlined link style
+            wb("PATCH", f"{_WS}/range(address='H{region_start}:H{end_row}')/format/font",
+               {"color": "#1155CC", "underline": "Single"})
+
+            # Alignment on all written cells
+            wb("PATCH", f"{_WS}/range(address='A{region_start}:{_LAST_COL}{end_row}')/format",
+               {"horizontalAlignment": "Left", "verticalAlignment": "Center"})
+        except SharePointOperationError:
+            logger.error("Failed applying formatting to written rows")
+            raise
+        logger.debug("Formatting applied successfully")
+
+        logger.info(
+            f"Done via Workbook API "
+            f"(sprints {current_sprint_num}/{next_sprint_num} | "
+            f"{len(api_map)} active, {len(issues)} tickets | "
+            f"{updated} updated, {len(new_composites)} added, "
+            f"{removed} marked-removed, {deleted} deleted | "
+            f"rows {region_start}-{end_row})"
+        )
+
+    # ── "Last Updated" timestamp in H2 ──
+    now = datetime.now().strftime("%m/%d/%Y %I:%M %p")
     try:
-        report = load_report(input_path)
-        tree = build_tree(report)
-    except SuspectReportError as exc:
-        print(f'Error: {exc}')
-        return 1
+        wb("PATCH", f"{_WS}/range(address='H2')",
+           {"values": [[f"Last Updated: {now}"]]})
+    except SharePointOperationError:
+        logger.error("Failed writing 'Last Updated' timestamp to H2")
+        raise
+    logger.info(f"Last Updated timestamp written: {now}")
 
-    helper = SharePointHelper()
-    item_id = helper.get_item_id(SPRINT_TEMPLATE_FILE)
-    session_id = helper.open_workbook_session(item_id)
+    return current_sprint_num
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Sprint filter (separate session so the Table range is up-to-date)
+# ═══════════════════════════════════════════════════════════════════
+
+def apply_sprint_filter(helper, item_id, session_id, current_sprint_num):
+    """Filter the Table's first column to show only the current sprint.
+
+    Must run in a separate session AFTER data writes are committed,
+    otherwise the Table range won't include newly inserted rows.
+    """
+    def wb(method, rel, body=None):
+        # Dispatch a Workbook API request through the SharePoint helper.
+        return helper.workbook_request(method, item_id, session_id, rel, body)
+
+    logger.info(f"Applying sprint filter for sprint {current_sprint_num}")
     try:
-        last_row, marker = write_suspect_report(helper, item_id, session_id, report, tree)
-    finally:
-        helper.close_workbook_session(item_id, session_id)
-
-    print(f"Wrote {last_row} rows to '{SHEET_NAME}' in {SPRINT_TEMPLATE_FILE} (marker={marker})")
-    return 0
-
-
-if __name__ == '__main__':
-    sys.exit(main(sys.argv))
+        tables_resp = wb("GET", f"{_WS}/tables")
+        table_list = tables_resp.get("value", [])
+        if table_list:
+            table_name = table_list[0]["name"]
+            wb("POST",
+               f"tables('{table_name}')/columns/itemAt(index=0)/filter/apply",
+               {"criteria": {
+                   "criterion1": f"={current_sprint_num}",
+                   "filterOn": "Custom"
+               }})
+            logger.info(f"Table filter applied: showing only Sprint {current_sprint_num}")
+        else:
+            logger.warning("No Excel Table found on sheet; cannot set filter programmatically via Graph API")
+    except Exception:
+        # Non-fatal: the data write already succeeded, so log and continue
+        # rather than failing the whole run over a cosmetic filter step.
+        logger.exception("Could not apply sprint filter")
