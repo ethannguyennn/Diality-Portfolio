@@ -157,17 +157,19 @@ Private Function BuildVelocitySheet(ByVal sprint As Long, rawData As Variant, fi
     Dim aMap As Object: Set aMap = CreateObject("Scripting.Dictionary")
     For idx = 1 To fCount
         r = filteredIdx(idx)
-        nm = Trim(CStr(rawData(r, C_ASSIGNEE)))
-        If nm = "" Then nm = "Unassigned"
-        stv = NormalizeStatus(Trim(CStr(rawData(r, C_STATUS))), statuses)
-        If Not aMap.Exists(nm) Then
-            Set inner = CreateObject("Scripting.Dictionary")
-            For si = LBound(statuses) To UBound(statuses)
-                inner(statuses(si)) = 0
-            Next si
-            aMap.Add nm, inner
+        If Trim(CStr(rawData(r, C_SCOPE))) <> "Move out of Sprint" Then
+            nm = Trim(CStr(rawData(r, C_ASSIGNEE)))
+            If nm = "" Then nm = "Unassigned"
+            stv = NormalizeStatus(Trim(CStr(rawData(r, C_STATUS))), statuses)
+            If Not aMap.Exists(nm) Then
+                Set inner = CreateObject("Scripting.Dictionary")
+                For si = LBound(statuses) To UBound(statuses)
+                    inner(statuses(si)) = 0
+                Next si
+                aMap.Add nm, inner
+            End If
+            aMap(nm)(stv) = aMap(nm)(stv) + 1
         End If
-        aMap(nm)(stv) = aMap(nm)(stv) + 1
     Next idx
  
     If aMap.Count > 0 Then
@@ -222,8 +224,10 @@ Private Function BuildVelocitySheet(ByVal sprint As Long, rawData As Variant, fi
     Next sti
     For idx = 1 To fCount
         r = filteredIdx(idx)
-        stv = NormalizeStatus(Trim(CStr(rawData(r, C_STATUS))), statuses)
-        statusMap(stv) = statusMap(stv) + 1
+        If Trim(CStr(rawData(r, C_SCOPE))) <> "Move out of Sprint" Then
+            stv = NormalizeStatus(Trim(CStr(rawData(r, C_STATUS))), statuses)
+            statusMap(stv) = statusMap(stv) + 1
+        End If
     Next idx
  
     ' ---------- create / replace the velocity sheet ----------
