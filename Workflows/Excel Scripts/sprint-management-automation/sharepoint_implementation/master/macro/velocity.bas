@@ -312,8 +312,8 @@ Private Function BuildVelocitySheet(ByVal sprint As Long, rawData As Variant, fi
     If peopleCount > 0 Then
         Set s1ChartRange = vel.Range(vel.Cells(s1HRow, 1), vel.Cells(s1HRow + peopleCount, s1LastCol - 1))
         Set s1Chart = vel.ChartObjects.Add( _
-            Left:=vel.Cells(s1HRow, s1LastCol + 1).Left + 15, _
-            Top:=vel.Cells(s1HRow, 1).Top, _
+            Left:=vel.Cells(1, 17).Left, _
+            Top:=vel.Cells(1, 17).Top, _
             Width:=580, _
             Height:=Application.WorksheetFunction.Max(300, peopleCount * 22 + 80))
         With s1Chart.Chart
@@ -367,7 +367,7 @@ Private Function BuildVelocitySheet(ByVal sprint As Long, rawData As Variant, fi
     If typeRowCount > 0 Then
         Set s2ChartRange = vel.Range(vel.Cells(s2HRow, 1), vel.Cells(s2HRow + typeRowCount, 2))
         Set s2Chart = vel.ChartObjects.Add( _
-            Left:=vel.Cells(s2Top, 4).Left + 15, Top:=vel.Cells(s2Top, 1).Top, _
+            Left:=vel.Cells(1, 9).Left, Top:=vel.Cells(1, 9).Top, _
             Width:=380, Height:=280)
         With s2Chart.Chart
             .ChartType = xlPie
@@ -426,7 +426,7 @@ Private Function BuildVelocitySheet(ByVal sprint As Long, rawData As Variant, fi
     If scopeRowCount > 0 Then
         Set s3ChartRange = vel.Range(vel.Cells(s3HRow, 1), vel.Cells(s3HRow + scopeRowCount, 2))
         Set s3Chart = vel.ChartObjects.Add( _
-            Left:=vel.Cells(s3Top, 4).Left + 15, Top:=vel.Cells(s3Top, 1).Top, _
+            Left:=vel.Cells(20, 9).Left, Top:=vel.Cells(20, 9).Top, _
             Width:=380, Height:=260)
         With s3Chart.Chart
             .ChartType = xlPie
@@ -478,7 +478,7 @@ Private Function BuildVelocitySheet(ByVal sprint As Long, rawData As Variant, fi
  
     Set s4ChartRange = vel.Range(vel.Cells(s4HRow, 1), vel.Cells(s4HRow + s4Count, 2))
     Set s4Chart = vel.ChartObjects.Add( _
-        Left:=vel.Cells(s4Top, 4).Left + 15, Top:=vel.Cells(s4Top, 1).Top, _
+        Left:=vel.Cells(38, 9).Left, Top:=vel.Cells(38, 9).Top, _
         Width:=400, Height:=260)
     With s4Chart.Chart
         .ChartType = xlPie
@@ -500,6 +500,15 @@ Private Function BuildVelocitySheet(ByVal sprint As Long, rawData As Variant, fi
  
     ' ---- autofit + hide ----
     vel.UsedRange.Columns.AutoFit
+
+    SetColWidthPixels vel.Columns("B"), 80
+    SetColWidthPixels vel.Columns("C"), 55
+    SetColWidthPixels vel.Columns("D"), 100
+    SetColWidthPixels vel.Columns("E"), 100
+    SetColWidthPixels vel.Columns("F"), 80
+    SetColWidthPixels vel.Columns("G"), 45
+    SetColWidthPixels vel.Columns("H"), 55
+
     vel.Visible = xlSheetHidden
  
     BuildVelocitySheet = sheetName
@@ -594,7 +603,7 @@ End Sub
 ' ----------------------------------------------------------------
 Private Sub UpdateVelocityChart(rawData As Variant, ByVal tocName As String, ByVal currentSprint As Long)
  
-    Const CHART_TITLE As String = "Sprint Committed vs Done with Completion %"
+    Const CHART_TITLE As String = "Leahi Sprint Velocity"
  
     Dim toc As Worksheet
     On Error Resume Next
@@ -698,7 +707,10 @@ Private Sub UpdateVelocityChart(rawData As Variant, ByVal tocName As String, ByV
         .SetSourceData Source:=seriesDataRange, PlotBy:=xlColumns
         .hasTitle = True
         .ChartTitle.Text = CHART_TITLE
- 
+
+        .HasLegend = True
+        .Legend.Position = xlLegendPositionBottom
+
         Set serCommitted = .SeriesCollection(1)
         Set serDone = .SeriesCollection(2)
         Set serPct = .SeriesCollection(3)
@@ -720,6 +732,11 @@ Private Sub UpdateVelocityChart(rawData As Variant, ByVal tocName As String, ByV
         serPct.HasDataLabels = True
         serPct.DataLabels.NumberFormat = "0%"
  
+        With .Axes(xlCategory, xlPrimary)
+            .hasTitle = True
+            .AxisTitle.Text = "Sprint #"
+        End With
+
         With .Axes(xlValue, xlPrimary)
             .hasTitle = True
             .AxisTitle.Text = "Work Items"
@@ -874,5 +891,21 @@ Private Function HexToLong(ByVal hexStr As String) As Long
     HexToLong = RGB(rC, gC, bC)
 End Function
 
+' Range.ColumnWidth is in character-width units, not pixels, and Excel
+' gives no direct pixel setter -- so nudge ColumnWidth until the range's
+' actual .Width (points, 96 px/in) matches the pixel target.
+Private Sub SetColWidthPixels(ByVal rng As Range, ByVal px As Double)
+    Dim targetPts As Double: targetPts = px * 72# / 96#
+    Dim guard As Long: guard = 0
+    rng.ColumnWidth = targetPts
+    Do While Abs(rng.Width - targetPts) > 0.5 And guard < 500
+        If rng.Width < targetPts Then
+            rng.ColumnWidth = rng.ColumnWidth + 0.25
+        Else
+            rng.ColumnWidth = rng.ColumnWidth - 0.25
+        End If
+        guard = guard + 1
+    Loop
+End Sub
 
 
