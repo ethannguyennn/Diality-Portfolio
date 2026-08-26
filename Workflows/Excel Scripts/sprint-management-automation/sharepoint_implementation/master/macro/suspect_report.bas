@@ -89,23 +89,23 @@ Public Sub ApplyTreeGrouping()
 
         If lvl = 1 Then      ' module
             ws.Rows(r).OutlineLevel = 2
-            rowBand.Interior.Color = RGB(112, 173, 71)   ' #70AD47
+            rowBand.Interior.Color = RGB(25, 124, 10)   ' #197c0a
             rowBand.Font.Bold = True
             rowBand.Font.Color = vbWhite
         ElseIf lvl = 2 Then  ' item
             ws.Rows(r).OutlineLevel = 3
-            rowBand.Interior.Color = RGB(169, 208, 142)  ' #A9D08E
+            rowBand.Interior.Color = RGB(138, 193, 218)  ' #8ac1da
             rowBand.Font.Bold = True
             AddJamaHyperlink ws, r
         ElseIf lvl = 3 Then  ' suspect
             ws.Rows(r).OutlineLevel = 4
             If prevLvl <> 3 Then stripeOn = False  ' first suspect row under an item: no stripe
-            If stripeOn Then rowBand.Interior.Color = RGB(226, 239, 218)  ' #E2EFDA
+            If stripeOn Then rowBand.Interior.Color = RGB(255, 255, 255) ' #FFFFFF
             stripeOn = Not stripeOn
             AddJamaHyperlink ws, r
         Else                 ' category (no level number in column A)
             ws.Rows(r).OutlineLevel = 1
-            rowBand.Interior.Color = RGB(16, 124, 65)    ' #107C41
+            rowBand.Interior.Color = RGB(56, 88, 153)    ' #385899
             rowBand.Font.Bold = True
             rowBand.Font.Color = vbWhite
             rowBand.Font.Size = 11
@@ -141,7 +141,7 @@ Private Sub FormatBanner(ws As Worksheet)
     ' Title banner across B1:D1.
     With ws.Range("B1:D1")
         .Merge
-        .Interior.Color = RGB(16, 124, 65)   ' #107C41
+        .Interior.Color = RGB(56, 88, 153) ' #385899
         .Font.Bold = True
         .Font.Size = 16
         .Font.Color = vbWhite
@@ -357,5 +357,6 @@ Private Function TreeIsConsistent(ws As Worksheet, lastTreeRow As Long) As Boole
     Next r
     TreeIsConsistent = True
 End Function
+
 
 
