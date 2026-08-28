@@ -2,11 +2,22 @@ Option Explicit
 
 Private Const SHEET_NAME As String = "Suspect Report"
 Private Const LEVEL_COL As String = "A"
-Private Const DATA_START_ROW As Long = 4
 
-Private Const BUILD_MARKER_CELL As String = "O1"   ' Python writes a fresh value here every run
-Private Const GROUPED_MARKER_CELL As String = "O2"  ' This macro writes here once it has grouped that version
-Private Const LAST_TREE_ROW_CELL As String = "O3"   ' Python writes the last tree row here (summary block starts after it)
+' Rows 1-62 are reserved for a separate table this macro does not own
+' and must never touch. suspect.py's own content starts at row 63: the
+' Module Summary first (fixed at SUMMARY_TITLE_ROW), then a blank-row
+' gap, then the tree at a fixed TREE_TITLE_ROW (not computed from the
+' summary's size, so a future table above can rely on it staying put).
+Private Const RESERVED_TOP_ROWS As Long = 62
+Private Const SUMMARY_TITLE_ROW As Long = RESERVED_TOP_ROWS + 1   ' 63
+Private Const TREE_TITLE_ROW As Long = 71
+Private Const TREE_SUBTITLE_ROW As Long = TREE_TITLE_ROW + 1      ' 72
+Private Const TREE_HEADER_ROW As Long = TREE_TITLE_ROW + 2        ' 73
+Private Const DATA_START_ROW As Long = TREE_HEADER_ROW + 1        ' 74
+
+Private Const BUILD_MARKER_CELL As String = "O71"   ' Python writes a fresh value here every run
+Private Const GROUPED_MARKER_CELL As String = "O72"  ' This macro writes here once it has grouped that version
+Private Const LAST_TREE_ROW_CELL As String = "O73"   ' Python writes the last tree row here
 
 Public Sub ApplyTreeGrouping()
     Dim ws As Worksheet
@@ -84,7 +95,7 @@ Public Sub ApplyTreeGrouping()
     ' item row, but one appended from the report's "Unlinked Downstream"
     ' section (no downstream link at all, not just a suspect one) rather
     ' than a normal item -- its background gets replaced with peach
-    ' (#E2EFDA) so it stands out from ordinary item rows. See ParseLevel.
+    ' (#F8CBAD) so it stands out from ordinary item rows. See ParseLevel.
     Dim r As Long, rawLvl As Variant, baseLvl As Long, prevBaseLvl As Long
     Dim isMissing As Boolean
     Dim stripeOn As Boolean
@@ -102,7 +113,7 @@ Public Sub ApplyTreeGrouping()
             rowBand.Font.Color = vbWhite
         ElseIf baseLvl = 2 Then  ' item (or missing item, appended at the end)
             ws.Rows(r).OutlineLevel = 3
-            rowBand.Interior.Color = RGB(252, 228, 214)  ' #FCE4D6
+            rowBand.Interior.Color = RGB(138, 193, 218)  ' #8ac1da
             rowBand.Font.Bold = True
             AddJamaHyperlink ws, r
         ElseIf baseLvl = 3 Then  ' suspect
@@ -120,13 +131,13 @@ Public Sub ApplyTreeGrouping()
         End If
 
         If isMissing Then
-            rowBand.Interior.Color = RGB(226, 239, 218)   ' E2EFDA -- flags a missing/unlinked row
+            rowBand.Interior.Color = RGB(248, 203, 173)   ' #F8CBAD -- flags a missing/unlinked row
         End If
 
         prevBaseLvl = baseLvl
     Next r
 
-    FormatSummary ws, lastTreeRow
+    FormatSummary ws
 
     ' Collapse to Category level only -- Module/Item/Suspect rows start
     ' hidden behind the outline's +/- buttons; Category rows (outline
@@ -144,14 +155,17 @@ CleanFail:
 End Sub
 
 ' ---- Banner, header row, and summary block -----------------------------
-' Layout positions mirror suspect.py's row plan: title row 1, subtitle
-' row 2, column headers row 3, tree from row 4 through O3, then a blank
-' row, the "Module Summary" title, a blank row, the summary header, one
-' row per module, and the Total row (the last used row in column B).
+' Layout positions mirror suspect.py's row plan: rows 1-62 are reserved
+' for a separate table (not built here, left untouched). The Module
+' Summary comes first, at a fixed SUMMARY_TITLE_ROW: title, blank,
+' summary header, one row per module, Total row. Then a blank-row gap,
+' then the tree at a fixed TREE_TITLE_ROW: title, subtitle, column
+' headers, then the tree body from DATA_START_ROW through whatever row
+' the LAST_TREE_ROW_CELL marker names.
 
 Private Sub FormatBanner(ws As Worksheet)
-    ' Title banner across B1:D1.
-    With ws.Range("B1:D1")
+    ' Title banner across B:D on TREE_TITLE_ROW.
+    With ws.Range("B" & TREE_TITLE_ROW & ":D" & TREE_TITLE_ROW)
         .Merge
         .Interior.Color = RGB(56, 88, 153)  ' #385899
         .Font.Bold = True
@@ -160,10 +174,10 @@ Private Sub FormatBanner(ws As Worksheet)
         .HorizontalAlignment = xlLeft
         .VerticalAlignment = xlCenter
     End With
-    ws.Rows(1).RowHeight = 30
+    ws.Rows(TREE_TITLE_ROW).RowHeight = 30
 
-    ' Subtitle across B2:D2.
-    With ws.Range("B2:D2")
+    ' Subtitle across B:D on TREE_SUBTITLE_ROW.
+    With ws.Range("B" & TREE_SUBTITLE_ROW & ":D" & TREE_SUBTITLE_ROW)
         .Merge
         .Font.Italic = True
         .Font.Size = 9
@@ -171,27 +185,38 @@ Private Sub FormatBanner(ws As Worksheet)
         .HorizontalAlignment = xlLeft
         .VerticalAlignment = xlCenter
     End With
-    ws.Rows(2).RowHeight = 18
+    ws.Rows(TREE_SUBTITLE_ROW).RowHeight = 18
 
     ' Column header row.
-    With ws.Range("B3:D3")
+    With ws.Range("B" & TREE_HEADER_ROW & ":D" & TREE_HEADER_ROW)
         .Interior.Color = RGB(255, 192, 0)   ' #FFC000
         .Font.Bold = True
         .Font.Size = 10
         .Font.Color = vbWhite
         .VerticalAlignment = xlCenter
     End With
-    ws.Range("B3").HorizontalAlignment = xlLeft
-    ws.Range("C3:D3").HorizontalAlignment = xlCenter
+    ws.Range("B" & TREE_HEADER_ROW).HorizontalAlignment = xlLeft
+    ws.Range("C" & TREE_HEADER_ROW & ":D" & TREE_HEADER_ROW).HorizontalAlignment = xlCenter
 End Sub
 
-Private Sub FormatSummary(ws As Worksheet, lastTreeRow As Long)
-    ' Module Summary block below the tree (see layout comment above).
+Private Sub FormatSummary(ws As Worksheet)
+    ' Module Summary block above the tree, at a fixed row (see layout
+    ' comment above) -- suspect.py refuses to write if this block would
+    ' ever grow large enough to reach TREE_TITLE_ROW, so it's safe to
+    ' anchor purely off SUMMARY_TITLE_ROW here.
     Dim titleRow As Long, headerRow As Long, totalRow As Long
-    titleRow = lastTreeRow + 2
+    titleRow = SUMMARY_TITLE_ROW
     headerRow = titleRow + 2
-    totalRow = ws.Cells(ws.Rows.Count, "B").End(xlUp).Row
-    If totalRow <= headerRow Then Exit Sub  ' summary block not written
+    If Trim(CStr(ws.Cells(headerRow, 2).Value)) = "" Then Exit Sub  ' summary block not written
+
+    ' Scan down from the header while column B keeps having a value --
+    ' the block's rows are always contiguous (no blank rows in between),
+    ' so the last non-blank one is the Total row.
+    totalRow = headerRow
+    Do While Trim(CStr(ws.Cells(totalRow + 1, 2).Value)) <> ""
+        totalRow = totalRow + 1
+    Loop
+    If totalRow <= headerRow Then Exit Sub  ' header written but no module rows
 
     With ws.Range(ws.Cells(titleRow, 2), ws.Cells(titleRow, 6))
         .Merge
