@@ -79,27 +79,35 @@ Public Sub ApplyTreeGrouping()
     ' driven by column A. Suspect rows (level 3) stripe alternating
     ' light green (#E2EFDA) / no fill, restarting at each item's block.
     ' Row visibility is set in one shot after the loop via ShowLevels.
-    Dim r As Long, lvl As Variant, prevLvl As Variant
+    '
+    ' A level of "2x" (instead of a plain 2) means the row is still an
+    ' item row, but one appended from the report's "Unlinked Downstream"
+    ' section (no downstream link at all, not just a suspect one) rather
+    ' than a normal item -- its background gets replaced with peach
+    ' (#E2EFDA) so it stands out from ordinary item rows. See ParseLevel.
+    Dim r As Long, rawLvl As Variant, baseLvl As Long, prevBaseLvl As Long
+    Dim isMissing As Boolean
     Dim stripeOn As Boolean
     Dim rowBand As Range
-    prevLvl = Empty
+    prevBaseLvl = -1
     For r = DATA_START_ROW To lastTreeRow
-        lvl = ws.Cells(r, LEVEL_COL).Value
+        rawLvl = ws.Cells(r, LEVEL_COL).Value
+        ParseLevel rawLvl, baseLvl, isMissing
         Set rowBand = ws.Range(ws.Cells(r, 2), ws.Cells(r, 4))
 
-        If lvl = 1 Then      ' module
+        If baseLvl = 1 Then      ' module
             ws.Rows(r).OutlineLevel = 2
             rowBand.Interior.Color = RGB(25, 124, 10)   ' #197c0a
             rowBand.Font.Bold = True
             rowBand.Font.Color = vbWhite
-        ElseIf lvl = 2 Then  ' item
+        ElseIf baseLvl = 2 Then  ' item (or missing item, appended at the end)
             ws.Rows(r).OutlineLevel = 3
-            rowBand.Interior.Color = RGB(138, 193, 218)  ' #8ac1da
+            rowBand.Interior.Color = RGB(252, 228, 214)  ' #FCE4D6
             rowBand.Font.Bold = True
             AddJamaHyperlink ws, r
-        ElseIf lvl = 3 Then  ' suspect
+        ElseIf baseLvl = 3 Then  ' suspect
             ws.Rows(r).OutlineLevel = 4
-            If prevLvl <> 3 Then stripeOn = False  ' first suspect row under an item: no stripe
+            If prevBaseLvl <> 3 Then stripeOn = False  ' first suspect row under an item: no stripe
             If stripeOn Then rowBand.Interior.Color = RGB(255, 255, 255) ' #FFFFFF
             stripeOn = Not stripeOn
             AddJamaHyperlink ws, r
@@ -111,7 +119,11 @@ Public Sub ApplyTreeGrouping()
             rowBand.Font.Size = 11
         End If
 
-        prevLvl = lvl
+        If isMissing Then
+            rowBand.Interior.Color = RGB(226, 239, 218)   ' E2EFDA -- flags a missing/unlinked row
+        End If
+
+        prevBaseLvl = baseLvl
     Next r
 
     FormatSummary ws, lastTreeRow
@@ -141,7 +153,7 @@ Private Sub FormatBanner(ws As Worksheet)
     ' Title banner across B1:D1.
     With ws.Range("B1:D1")
         .Merge
-        .Interior.Color = RGB(56, 88, 153) ' #385899
+        .Interior.Color = RGB(56, 88, 153)  ' #385899
         .Font.Bold = True
         .Font.Size = 16
         .Font.Color = vbWhite
@@ -345,11 +357,11 @@ Private Function TreeIsConsistent(ws As Worksheet, lastTreeRow As Long) As Boole
     ' True when every tree row's outline level matches its column-A level.
     ' Only structure is checked -- row visibility (expanded/collapsed) is
     ' the user's choice and deliberately ignored.
-    Dim r As Long, lvl As Variant, expected As Long
+    Dim r As Long, baseLvl As Long, isMissing As Boolean, expected As Long
     For r = DATA_START_ROW To lastTreeRow
-        lvl = ws.Cells(r, LEVEL_COL).Value
-        If lvl = 1 Or lvl = 2 Or lvl = 3 Then
-            expected = CLng(lvl) + 1
+        ParseLevel ws.Cells(r, LEVEL_COL).Value, baseLvl, isMissing
+        If baseLvl = 1 Or baseLvl = 2 Or baseLvl = 3 Then
+            expected = baseLvl + 1
         Else
             expected = 1
         End If
@@ -358,5 +370,23 @@ Private Function TreeIsConsistent(ws As Worksheet, lastTreeRow As Long) As Boole
     TreeIsConsistent = True
 End Function
 
+' ---- Level parsing ------------------------------------------------------
+' Column A holds a plain 1/2/3 for a normal module/item/suspect row, or
+' "1x"/"2x"/"3x" for the same level when suspect.py flagged that row as
+' missing (an item with no downstream link at all, not just a suspect
+' one) -- see suspect.py's _leveled(). Blank (category rows) or anything
+' else parses to baseLvl = 0.
+Private Sub ParseLevel(ByVal rawValue As Variant, ByRef baseLvl As Long, ByRef isMissing As Boolean)
+    Dim s As String
+    s = Trim(CStr(rawValue))
+    isMissing = False
+    baseLvl = 0
+    If Len(s) = 0 Then Exit Sub
+    If Right(s, 1) = "x" Or Right(s, 1) = "X" Then
+        isMissing = True
+        s = Left(s, Len(s) - 1)
+    End If
+    If IsNumeric(s) Then baseLvl = CLng(s)
+End Sub
 
 
